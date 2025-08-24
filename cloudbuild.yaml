@@ -1,0 +1,37 @@
+# cloudbuild.yaml
+# Google Cloud Buildの設定ファイルです。
+# このファイルはDockerイメージをビルドし、
+# GCRにプッシュしてCloud Runにデプロイするために使用されます。
+
+substitutions:
+	_LOCATION: <Artifact Registryのロケーション>
+	_REPOSITORY: <Artifact Registryの名前>
+  _IMAGE_NAME: <作成されるDockerイメージの名前>
+  _TAG: <作成されるDockerイメージのタグ>
+  _SERVICE_NAME: <Cloud Runにデプロイされるアプリケーションの名前>
+  _REGION: <Cloud Runのリージョン>
+  
+steps:
+  # ステップ 1: Kanikoを使用してDockerイメージをビルドして、リポジトリにPushする
+  - name: 'gcr.io/kaniko-project/executor:latest'
+    args:
+    - --destination=${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
+    - --dockerfile=<GitHub上でのDockerfileのパス>
+    - --cache=true
+    - --cache-ttl=8h
+    - --compressed-caching=false
+    - --cache-copy-layers=true
+    id: Build & Push
+
+  # ステップ 2: Cloud Runにデプロイする
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args: ['run', 'deploy', '${_SERVICE_NAME}', 
+           '--image', '${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}', 
+           '--region', '${_REGION}',
+           '--platform', 'managed',
+           '--allow-unauthenticated',
+           '--memory', '2Gi',
+           '--concurrency', '1',
+           ]
+    id: Deploy
