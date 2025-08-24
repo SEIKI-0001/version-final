@@ -1,13 +1,16 @@
 substitutions:
-  _LOCATION: asia-northeast1          # ← Artifact Registry と Cloud Run を揃える
-  _REPOSITORY: version-final          # ← Artifact Registry のリポジトリ名
-  _IMAGE_NAME: version-final          # ← イメージ名
-  _TAG: $COMMIT_SHA                   # ← タグ（固定文字でもOK）
-  _SERVICE_NAME: version-final        # ← Cloud Run サービス名（新規/既存どちらでも）
+  _LOCATION: asia-northeast1
+  _REPOSITORY: version-final
+  _IMAGE_NAME: version-final
+  _TAG: $COMMIT_SHA
+  _SERVICE_NAME: version-final
   _REGION: asia-northeast1
 
+# ← これを追加：ログは Cloud Logging のみに
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
-  # 1) Kaniko で Dockerfile をビルドして Artifact Registry へ push
   - name: 'gcr.io/kaniko-project/executor:latest'
     args:
       - --destination=${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
@@ -19,7 +22,6 @@ steps:
       - --cache-copy-layers=true
     id: Build & Push
 
-  # 2) Cloud Run へデプロイ
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'gcloud'
     args:
