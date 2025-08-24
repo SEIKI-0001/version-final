@@ -19,7 +19,7 @@ steps:
       - --cache-ttl=8h
       - --compressed-caching=false
       - --cache-copy-layers=true
-    id: "Build & Push"
+    id: Build & Push
 
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'gcloud'
