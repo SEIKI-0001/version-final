@@ -402,3 +402,46 @@ def generate_plan(payload: dict = Body(...)):
         # 必要なら "plan": plan_df.to_dict(orient="records") を返す
     }
 
+
+#/get_tasks
+def get_user_spreadsheet_id(user_id: str) -> Optional[str]:
+    mapping = load_user_sheet_map()
+    if not mapping or user_id not in mapping:
+        return None
+    return mapping[user_id].get("spreadsheet_id")
+
+@app.post("/get_tasks")
+def get_tasks(payload: dict = Body(...)):
+    user_id = (payload.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    try:
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_title = meta["sheets"][0]["properties"]["title"]
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F10000"
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read sheet: {e}"}, status_code=500)
+
+    values = res.get("values", [])
+    if not values or len(values) < 2:
+        return {"tasks": []}
+
+    headers = values[0]
+    rows = values[1:]
+    tasks = [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in rows
+        if any((c or "").strip() for c in row)
+    ]
+    return {"tasks": tasks}
