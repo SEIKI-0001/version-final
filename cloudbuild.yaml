@@ -1,37 +1,40 @@
-# cloudbuild.yaml
-# Google Cloud Buildの設定ファイルです。
-# このファイルはDockerイメージをビルドし、
-# GCRにプッシュしてCloud Runにデプロイするために使用されます。
-
 substitutions:
-	_LOCATION: <Artifact Registryのロケーション>
-	_REPOSITORY: <Artifact Registryの名前>
-  _IMAGE_NAME: <作成されるDockerイメージの名前>
-  _TAG: <作成されるDockerイメージのタグ>
-  _SERVICE_NAME: <Cloud Runにデプロイされるアプリケーションの名前>
-  _REGION: <Cloud Runのリージョン>
-  
+  _LOCATION: asia-northeast1          # ← Artifact Registry と Cloud Run を揃える
+  _REPOSITORY: version-final          # ← Artifact Registry のリポジトリ名
+  _IMAGE_NAME: version-final          # ← イメージ名
+  _TAG: $COMMIT_SHA                   # ← タグ（固定文字でもOK）
+  _SERVICE_NAME: version-final        # ← Cloud Run サービス名（新規/既存どちらでも）
+  _REGION: asia-northeast1
+
 steps:
-  # ステップ 1: Kanikoを使用してDockerイメージをビルドして、リポジトリにPushする
+  # 1) Kaniko で Dockerfile をビルドして Artifact Registry へ push
   - name: 'gcr.io/kaniko-project/executor:latest'
     args:
-    - --destination=${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
-    - --dockerfile=<GitHub上でのDockerfileのパス>
-    - --cache=true
-    - --cache-ttl=8h
-    - --compressed-caching=false
-    - --cache-copy-layers=true
+      - --destination=${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
+      - --dockerfile=./Dockerfile
+      - --context=.
+      - --cache=true
+      - --cache-ttl=8h
+      - --compressed-caching=false
+      - --cache-copy-layers=true
     id: Build & Push
 
-  # ステップ 2: Cloud Runにデプロイする
+  # 2) Cloud Run へデプロイ
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'gcloud'
-    args: ['run', 'deploy', '${_SERVICE_NAME}', 
-           '--image', '${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}', 
-           '--region', '${_REGION}',
-           '--platform', 'managed',
-           '--allow-unauthenticated',
-           '--memory', '2Gi',
-           '--concurrency', '1',
-           ]
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image
+      - ${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --memory
+      - 2Gi
+      - --concurrency
+      - "1"
     id: Deploy
