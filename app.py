@@ -29,6 +29,10 @@ OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID")
 OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET")
 APP_SECRET = os.getenv("APP_SECRET", "")
 TOKEN_BUCKET = os.getenv("TOKEN_BUCKET", "gpts-oauth-tokens")
+USER_SHEET_MAP_BUCKET = os.getenv("USER_SHEET_MAP_BUCKET", "user-sheet-mapping")
+USER_SHEET_MAP_BLOB = os.getenv("USER_SHEET_MAP_BLOB", "mapping.json")
+BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup")  
+
 
 # Google API スコープ（必要最低限：Sheets/Drive.file/Calendar.events）
 SCOPES = [
