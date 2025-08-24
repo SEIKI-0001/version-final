@@ -17,4 +17,4 @@ class GenReq(BaseModel):
 
 @app.post("/generate")
 def generate(req: GenReq):
-    return {"echo": req.model_dump(), "ok": True}
+    return {"ok": True, "echo": req.model_dump()}
