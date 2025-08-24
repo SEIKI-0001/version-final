@@ -186,3 +186,6 @@ async def generate(request: Request):
         })
     # ここから先は「認証済み」→ 後でSheets/Calendar処理を実装
     return {"requires_auth": False, "message": "Authorized. Ready for plan generation."}
+
+port = int(os.environ.get("PORT", "8080"))
+app.run(host="0.0.0.0", port=port)
