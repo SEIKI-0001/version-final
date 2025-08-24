@@ -2,7 +2,7 @@ substitutions:
   _LOCATION: asia-northeast1
   _REPOSITORY: version-final
   _IMAGE_NAME: version-final
-  _TAG: $COMMIT_SHA
+  _TAG: $SHORT_SHA        # ← ここを SHORT_SHA に
   _SERVICE_NAME: version-final
   _REGION: asia-northeast1
 
@@ -10,7 +10,7 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  - name: 'gcr.io/kaniko-project/executor:latest'
+  - name: 'gcr.io/kaniko-project/executor:v1.23.2-debug'  # ← latestは避けて固定推奨
     args:
       - --destination=${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${_TAG}
       - --dockerfile=./Dockerfile
@@ -21,7 +21,7 @@ steps:
       - --cache-copy-layers=true
     id: "Build & Push"
 
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:474.0.0'  # ← これも固定推奨
     entrypoint: 'gcloud'
     args:
       - run
@@ -37,5 +37,6 @@ steps:
       - --memory
       - 2Gi
       - --concurrency
-      - "1"
+      - 10                 # ← 数値で、1は避ける（性能・安定のため）
+      # （Cloud Run 側に環境変数/シークレットを設定済みなら何も渡さない）
     id: Deploy
