@@ -6,7 +6,6 @@ substitutions:
   _SERVICE_NAME: version-final
   _REGION: asia-northeast1
 
-# ← これを追加：ログは Cloud Logging のみに
 options:
   logging: CLOUD_LOGGING_ONLY
 
