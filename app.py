@@ -39,8 +39,8 @@ def required_envs_ok() -> bool:
 def root():
     return {"ok": True}
 
-@app.get("/healthz")
-def healthz():
+@app.get("/health")
+def health():
     return {"ok": True, "env_ready": required_envs_ok()}
 
 # ====== GCS トークン保存 ======
