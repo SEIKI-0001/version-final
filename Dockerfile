@@ -1,4 +1,3 @@
-# Dockerfile
 FROM python:3.9-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -6,8 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
 WORKDIR /app
-# sample_hello.py はルートに置く想定
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY sample_hello.py .
 
-# Cloud Run が注入する $PORT を使って起動
-CMD ["python", "sample_hello.py"]
+# Cloud Run が注入する $PORT を使用
+CMD ["sh","-c","uvicorn sample_hello:app --host 0.0.0.0 --port ${PORT:-8080} --log-level info"]
