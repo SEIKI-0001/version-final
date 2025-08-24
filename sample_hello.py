@@ -1,22 +1,20 @@
-import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-PORT = int(os.getenv("PORT", "8080"))
+app = FastAPI()
 
-class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json"):
-        b = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+@app.get("/")
+def root():
+    return {"message": "Hello, World! from FastAPI"}
 
-    def do_GET(self):
-        if self.path in ("/", "/healthz"):
-            self._send(200, '{"ok": true}')
-        else:
-            self._send(404, '{"error":"not found"}')
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
-if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+class GenReq(BaseModel):
+    user_id: str | None = None
+    message: str | None = None
+
+@app.post("/generate")
+def generate(req: GenReq):
+    return {"echo": req.model_dump(), "ok": True}
