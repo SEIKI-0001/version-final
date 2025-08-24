@@ -9,13 +9,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 3) 作業ディレクトリ
 WORKDIR /app
 
-# 4) 依存を先にコピー→インストール
+# 4) 依存
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /app/requirements.txt
 
-# 5) アプリ本体コピー
-COPY sample_hello.py /app/sample_hello.py
+# 5) アプリ本体コピー（←ここを app.py に）
+COPY app.py /app/app.py
 
-# 6) 起動（必ず 0.0.0.0:8080 で待ち受け）
-CMD ["uvicorn", "sample_hello:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]
+# 6) 起動
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]
