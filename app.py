@@ -184,3 +184,30 @@ def auth_status(user_id: Optional[str] = None):
         return JSONResponse({"error": "user_id is required"}, status_code=400)
     has = bool(load_refresh_token(user_id))
     return {"user_id": user_id, "authorized": has}
+
+#OAuth refresh_token → Credentials 再構築ヘルパー
+def load_user_credentials(user_id: str) -> Optional[UserCredentials]:
+    rt = load_refresh_token(user_id)
+    if not rt:
+        return None
+    creds = UserCredentials(
+        token=None,
+        refresh_token=rt,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=OAUTH_CLIENT_ID,
+        client_secret=OAUTH_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+    try:
+        if not creds.valid:
+            creds.refresh(GoogleRequest())
+    except Exception:
+        return None
+    return creds
+
+def get_user_sheets_service(user_id: str):
+    creds = load_user_credentials(user_id)
+    if not creds:
+        return None
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
