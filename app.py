@@ -211,3 +211,194 @@ def get_user_sheets_service(user_id: str):
         return None
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
+
+
+#studyplanner置き換え対象
+def expand_chapter_items(counts: List[int]) -> List[str]:
+    items = []
+    for idx, c in enumerate(counts):
+        for j in range(1, c + 1):
+            items.append(f"Chapter {idx+1} - Item {j}")
+    return items
+
+def load_chapter_data_from_gcs(book_filename: str) -> List[str]:
+    # study-book-data/<book>.json に ["Chapter 1 - Item 1", ...] 形式で置く想定
+    client = storage.Client()
+    bucket = client.bucket("study-book-data")
+    blob = bucket.blob(book_filename)
+    return json.loads(blob.download_as_text())
+
+DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+@dataclass
+class UserSetting:
+    user_id: str
+    target_exam: datetime
+    start_date: datetime
+    weekday_minutes: int
+    weekend_minutes: int
+    rest_days: List[str]
+    weekday_start: str
+    weekend_start: str
+    book_keyword: str
+
+def _weekday_minutes(user: UserSetting, d: datetime) -> int:
+    if DAY_ABBR[d.weekday()] in set(user.rest_days):
+        return 0
+    return user.weekend_minutes if d.weekday() >= 5 else user.weekday_minutes
+
+def generate_study_plan(payload: dict, user_id: str) -> Tuple[pd.DataFrame, UserSetting]:
+    user = UserSetting(
+        user_id=user_id,
+        target_exam=datetime.strptime(payload["target_exam_date"], "%Y-%m-%d"),
+        start_date=datetime.strptime(payload["start_date"], "%Y-%m-%d"),
+        weekday_minutes=int(payload["weekday_minutes"]),
+        weekend_minutes=int(payload["weekend_minutes"]),
+        rest_days=payload.get("rest_days", ["Wed"]),
+        weekday_start=payload.get("weekday_start", "20:00"),
+        weekend_start=payload.get("weekend_start", "13:00"),
+        book_keyword=payload["book_keyword"],
+    )
+
+    # 章リスト（counts or 文字列リスト）
+    chapter_items_list = payload.get("chapter_items_list")
+    if chapter_items_list:
+        if all(isinstance(x, int) for x in chapter_items_list):
+            chapter_items_list = expand_chapter_items(chapter_items_list)
+    else:
+        chapter_items_list = load_chapter_data_from_gcs(f"{user.book_keyword}.json")
+
+    # —— 簡易割当: 初回周回を MIN=10分単位で順番に詰める
+    MIN = 10
+    d = user.start_date
+    tasks = []
+    i = 0
+    while i < len(chapter_items_list) and d <= user.target_exam:
+        avail = _weekday_minutes(user, d)
+        if avail == 0:
+            d += timedelta(days=1); continue
+        used = 0
+        start_of_day = True
+        while i < len(chapter_items_list) and used + MIN <= avail:
+            name = chapter_items_list[i]
+            tasks.append({
+                "WBS": "",  # 後で連番
+                "Task Name": name,
+                "Date": d.strftime("%Y-%m-%d"),
+                "Day": DAY_ABBR[d.weekday()],
+                "Duration": MIN,
+                "Status": "未着手",
+            })
+            used += MIN
+            i += 1
+            start_of_day = False
+        d += timedelta(days=1)
+
+    # DataFrame 化 & WBS 採番
+    df = pd.DataFrame(tasks, columns=["WBS", "Task Name", "Date", "Day", "Duration", "Status"])
+    df["WBS"] = [f"wbs{i}" for i in range(len(df))]
+    return df, user
+
+#シート作成＆書き込み、マッピング保存
+def create_sheet_and_write(plan_df: pd.DataFrame, sheet_title: str, user_id: str) -> str:
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        raise PermissionError("No OAuth tokens. Authorize first.")
+
+    sheet = svc.spreadsheets().create(
+        body={"properties": {"title": sheet_title}}, fields="spreadsheetId"
+    ).execute()
+    spreadsheet_id = sheet["spreadsheetId"]
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id, range="A1", valueInputOption="RAW",
+        body={"values": [list(plan_df.columns)]}
+    ).execute()
+    if not plan_df.empty:
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range="A2", valueInputOption="RAW",
+            body={"values": plan_df.values.tolist()}
+        ).execute()
+    return spreadsheet_id
+
+def generate_sheet_title(user: UserSetting) -> str:
+    return f"user_{user.user_id}_plan_{user.start_date.strftime('%Y%m%d')}"
+
+def load_user_sheet_map() -> Dict[str, Dict[str, str]]:
+    client = storage.Client()
+    bucket = client.bucket(USER_SHEET_MAP_BUCKET)
+    blob = bucket.blob(USER_SHEET_MAP_BLOB)
+    if not blob.exists():
+        return {}
+    return json.loads(blob.download_as_text())
+
+def save_user_sheet_map(mapping: Dict[str, Dict[str, str]]) -> None:
+    client = storage.Client()
+    bucket = client.bucket(USER_SHEET_MAP_BUCKET)
+    blob = bucket.blob(USER_SHEET_MAP_BLOB)
+    blob.upload_from_string(json.dumps(mapping, ensure_ascii=False), content_type="application/json")
+
+
+#/generate エンドポイント（FastAPI版）
+from fastapi import Body
+
+@app.post("/generate")
+def generate_plan(payload: dict = Body(...)):
+    user_id = (payload.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    # 認可チェック（未連携なら authorize_url を 200 で返す）
+    if not load_user_credentials(user_id):
+        if not required_envs_ok():
+            return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent",
+            state=signed_state(user_id)
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Please authorize via the URL, then retry."
+        }, status_code=200)
+
+    # 生成 → Sheets 書き込み
+    try:
+        plan_df, user = generate_study_plan(payload, user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
+
+    try:
+        spreadsheet_id = create_sheet_and_write(plan_df, generate_sheet_title(user), user_id)
+    except PermissionError:
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent",
+            state=signed_state(user_id)
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Authorization expired. Please re-authorize."
+        }, status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+
+    # マッピング保存（任意：失敗しても処理は続行）
+    try:
+        mapping = load_user_sheet_map()
+        mapping[user_id] = {"spreadsheet_id": spreadsheet_id, "spreadsheet_url": spreadsheet_url}
+        save_user_sheet_map(mapping)
+    except Exception as e:
+        print("[warn] save mapping failed:", e)
+
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "plan_rows": len(plan_df)
+        # 必要なら "plan": plan_df.to_dict(orient="records") を返す
+    }
+
