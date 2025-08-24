@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 # ===== Third-party =====
 import pandas as pd
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -31,7 +31,9 @@ APP_SECRET = os.getenv("APP_SECRET", "")
 TOKEN_BUCKET = os.getenv("TOKEN_BUCKET", "gpts-oauth-tokens")
 USER_SHEET_MAP_BUCKET = os.getenv("USER_SHEET_MAP_BUCKET", "user-sheet-mapping")
 USER_SHEET_MAP_BLOB = os.getenv("USER_SHEET_MAP_BLOB", "mapping.json")
-BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup")  
+BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup") 
+SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
+EXEMPT_PATHS = {"/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"}
 
 
 # Google API スコープ（必要最低限：Sheets/Drive.file/Calendar.events）
@@ -55,6 +57,22 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "env_ready": required_envs_ok()}
+
+#　====== api_key認証 ======
+def verify_api_key(request: Request, authorization: str = Header(None)):
+    path = (request.url.path or "/").rstrip("/") or "/"
+    if path in EXEMPT_PATHS:   # OAuth/health は免除
+        return
+    expected = (SERVICE_API_KEY or "").strip()
+    if not expected:
+        raise HTTPException(500, "Server API key not configured")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(403, "Invalid API key")
+    provided = authorization[7:].strip()
+    # タイミング攻撃対策に恒等時間比較
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(403, "Invalid API key")
+
 
 # ====== GCS トークン保存 ======
 def _token_bucket() -> storage.Bucket:
@@ -342,7 +360,7 @@ def save_user_sheet_map(mapping: Dict[str, Dict[str, str]]) -> None:
 #/generate エンドポイント（FastAPI版）
 from fastapi import Body
 
-@app.post("/generate")
+@app.post("/generate", dependencies=[Depends(verify_api_key)])
 def generate_plan(payload: dict = Body(...)):
     user_id = (payload.get("user_id") or "").strip()
     if not user_id:
