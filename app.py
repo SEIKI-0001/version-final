@@ -892,6 +892,147 @@ def update_task(payload: dict = Body(...)):
         "updated_fields": list(normalized_updates.keys())
     }
 
+# === New: Insert task by date ===
+@app.post("/insert_task", dependencies=[Depends(verify_api_key)])
+def insert_task(payload: dict = Body(...)):
+    """
+    指定された日付(必須)の位置に行を挿入し、タスクを追加する。
+    その後、A列のWBSを先頭値に合わせて連番で振り直す。
+    並びルール（asc）: C列(Date) 昇順。同一日付は末尾。
+    """
+    from datetime import datetime
+
+    def _parse_date(s: str):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    user_id = (payload.get("user_id") or "").strip()
+    task_in = (payload.get("task") or {})
+    order = (payload.get("order") or "asc").lower()
+    if not user_id or not task_in:
+        return JSONResponse({"error": "user_id and task are required"}, status_code=400)
+
+    # 列構造に合わせて取り出し
+    task_txt = (task_in.get("task") or "").strip()          # B: Task Name
+    date_str = (task_in.get("date") or "").strip()          # C: Date
+    day_str  = (task_in.get("day")  or "").strip()          # D: Day
+    duration_raw = task_in.get("duration", "")              # E: Duration
+    status   = (task_in.get("status") or "未着手").strip()  # F: Status
+    ins_date = _parse_date(date_str)
+    if not ins_date:
+        return JSONResponse({"error": "task.date must be 'YYYY-MM-DD'"}, status_code=400)
+    if not day_str:
+        day_str = DAY_ABBR[ins_date.weekday()]
+    try:
+        duration_val = int(duration_raw)
+    except Exception:
+        duration_val = 60  # デフォルト
+
+    # ========== Spreadsheet / Sheet ==========
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+    service = get_user_sheets_service(user_id)
+    if service is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet = meta["sheets"][0]
+        sheet_id = sheet["properties"]["sheetId"]
+        sheet_title = sheet["properties"]["title"]
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch sheet metadata: {e}"}, status_code=500)
+
+    # 既存データ（C列: Date）取得
+    rng_c_all = f"{sheet_title}!C2:C10000"
+    try:
+        res = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=rng_c_all
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read existing rows: {e}"}, status_code=500)
+    rows = res.get("values", [])
+
+    # 挿入位置決定
+    insert_row_1based = 2 + len(rows)
+    if order == "asc":
+        for i, r in enumerate(rows):
+            r_date = _parse_date((r[0] if r else "").strip())
+            if r_date and ins_date < r_date:
+                insert_row_1based = 2 + i
+                break
+
+    # 行挿入
+    start_idx0 = insert_row_1based - 1
+    end_idx0 = start_idx0 + 1
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [{
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": start_idx0,
+                            "endIndex": end_idx0
+                        },
+                        "inheritFromBefore": True
+                    }
+                }]
+            }
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Insert row failed: {e}"}, status_code=500)
+
+    # 値書き込み
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_title}!B{insert_row_1based}:F{insert_row_1based}",
+            valueInputOption="RAW",
+            body={"values": [[task_txt, date_str, day_str, str(duration_val), status]]}
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Write values failed: {e}"}, status_code=500)
+
+    # A列のWBSふり直し
+    try:
+        resA = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A2:A10000"
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read WBS column: {e}"}, status_code=500)
+    a_vals = resA.get("values", [])
+
+    def _wbs_start(a_first: str) -> int:
+        try:
+            return int((a_first or "").lower().replace("wbs", "").strip())
+        except Exception:
+            return 0
+
+    start_num = _wbs_start((a_vals[0][0] if a_vals and a_vals[0] else "").strip()) if a_vals else 0
+    new_wbs_col = [[f"wbs{start_num + i}"] for i in range(len(a_vals))]
+    if new_wbs_col:
+        try:
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_title}!A2:A{len(new_wbs_col)+1}",
+                valueInputOption="RAW",
+                body={"values": new_wbs_col}
+            ).execute()
+        except Exception as e:
+            return JSONResponse({"error": f"Renumber WBS failed: {e}"}, status_code=500)
+
+    inserted_wbs = f"wbs{start_num + (insert_row_1based - 2)}"
+    return {
+        "message": "Task inserted",
+        "inserted_row": insert_row_1based,
+        "wbs": inserted_wbs
+    }
+
 # === New: Backup-only & Regenerate endpoints ===
 
 @app.post("/backup", dependencies=[Depends(verify_api_key)])
