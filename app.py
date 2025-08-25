@@ -214,6 +214,46 @@ def get_user_sheets_service(user_id: str):
         return None
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
+# ========= Calendar Service Helper =========
+def get_user_calendar_service(user_id: str):
+    creds = load_user_credentials(user_id)
+    if not creds:
+        return None
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+# ========= 日付/時刻ユーティリティ =========
+def _parse_date_yyyy_mm_dd(s: str) -> Optional[datetime.date]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _parse_hh_mm(s: str) -> Optional[datetime.time]:
+    try:
+        return datetime.strptime(s, "%H:%M").time()
+    except Exception:
+        return None
+
+def start_of_week(d: datetime.date) -> datetime.date:
+    # 月曜始まり（0=Mon）
+    return d - timedelta(days=d.weekday())
+
+def next_monday(today: Optional[datetime.date] = None) -> datetime.date:
+    today = today or datetime.utcnow().date()
+    n = (7 - today.weekday()) % 7
+    n = 1 if n == 0 else n  # きょうが月曜でも次週の月曜に
+    return today + timedelta(days=n)
+
+def rfc3339(dt_date: datetime.date, hhmm: Optional[str]) -> Optional[str]:
+    # hhmm が無ければ None（終日扱い）
+    if not hhmm:
+        return None
+    return f"{dt_date.isoformat()}T{hhmm}:00{TZ_OFFSET}"
+
+def make_event_id(user_id: str, wbs: str, date_str: str) -> str:
+    raw = f"{user_id}|{wbs}|{date_str}".lower().encode()
+    h = hashlib.sha1(raw).hexdigest()
+    return f"gpts-{h}"
 
 # ===== Study Plan Core =====
 @dataclass
@@ -1145,6 +1185,318 @@ def delete_task(payload: dict = Body(...)):
         "message": "Task deleted (row removed) and WBS renumbered",
         "deleted_row": target_row_index_1based,
         "renumber": {"start": start_num, "count": len(new_wbs_col)}
+    }
+
+# === New: Preview tasks for a week ===
+@app.post("/preview_week", dependencies=[Depends(verify_api_key)])
+def preview_week(payload: dict = Body(...)):
+    """
+    指定 week_of(YYYY-MM-DDのどこかの日) を含む週の予定を返す。
+    無指定なら「次週の月〜日」。
+    返却キー: WBS, Date, Start, End, Task Name, Status, Note など（シートの列に依存）
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    week_of = (payload.get("week_of") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    try:
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_title = meta["sheets"][0]["properties"]["title"]
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:G10000"
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read sheet: {e}"}, status_code=500)
+
+    values = res.get("values", [])
+    if not values or len(values) < 2:
+        return {"tasks": []}
+
+    headers = values[0]
+    rows = values[1:]
+
+    if week_of:
+        base = _parse_date_yyyy_mm_dd(week_of) or datetime.utcnow().date()
+        monday = start_of_week(base)
+    else:
+        monday = next_monday()
+    sunday = monday + timedelta(days=6)
+
+    out = []
+    for r in rows:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        d = _parse_date_yyyy_mm_dd((row.get("Date") or "").strip())
+        if d and monday <= d <= sunday:
+            out.append(row)
+
+    return {
+        "week": {"start": monday.isoformat(), "end": sunday.isoformat()},
+        "tasks": out
+    }
+
+# === New: Register a week's tasks to Google Calendar ===
+@app.post("/calendar/register_week", dependencies=[Depends(verify_api_key)])
+def calendar_register_week(payload: dict = Body(...)):
+    """
+    指定週のタスクを Google カレンダーに登録/更新。
+    body:
+      {
+        "user_id": "...",
+        "week_of": "YYYY-MM-DD",   # 任意。未指定なら次週
+        "calendar_id": "primary",  # 任意
+        "dry_run": false           # 任意。trueなら作成せず差分だけ返す
+      }
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    week_of = (payload.get("week_of") or "").strip()
+    calendar_id = (payload.get("calendar_id") or "primary").strip()
+    dry_run = bool(payload.get("dry_run", False))
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    # 週次データ取得（preview_week と同等ロジック）
+    prev = preview_week({"user_id": user_id, "week_of": week_of})  # FastAPI内の直接呼び出し
+    # preview_week は dict を返す契約（上でそう実装）
+    if isinstance(prev, JSONResponse):
+        return prev
+    tasks = prev.get("tasks", [])
+    week = prev.get("week", {})
+    if not tasks:
+        return {"message": "No tasks in the target week", "week": week, "created": [], "updated": [], "skipped": []}
+
+    cal = get_user_calendar_service(user_id)
+    if cal is None:
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent",
+            state=signed_state(user_id)
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Calendar authorization required. Please authorize and retry."
+        }, status_code=200)
+
+    created, updated, skipped = [], [], []
+    for row in tasks:
+        wbs = (row.get("WBS") or "").strip()
+        date_str = (row.get("Date") or "").strip()
+        task_name = (row.get("Task Name") or "").strip() or (row.get("task") or "").strip()
+        status = (row.get("Status") or "").strip()
+        note = (row.get("Note") or "").strip()
+        start_hhmm = (row.get("Start") or row.get("start") or "").strip()
+        end_hhmm = (row.get("End") or row.get("end") or "").strip()
+
+        duration_min = None
+        try:
+            duration_min = int((row.get("Duration") or "0").strip())
+        except Exception:
+            pass
+
+        start_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), start_hhmm)
+        if start_iso:
+            if end_hhmm:
+                end_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), end_hhmm)
+            else:
+                mins = duration_min if duration_min and duration_min > 0 else 60
+                end_dt = datetime.strptime(f"{date_str} {start_hhmm}", "%Y-%m-%d %H:%M") + timedelta(minutes=mins)
+                end_iso = f"{end_dt.strftime('%Y-%m-%dT%H:%M')}:00{TZ_OFFSET}"
+            body = {
+                "summary": task_name or "学習タスク",
+                "description": f"Status: {status}\nNote: {note}",
+                "start": {"dateTime": start_iso, "timeZone": USER_TZ},
+                "end": {"dateTime": end_iso, "timeZone": USER_TZ},
+                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
+            }
+        else:
+            body = {
+                "summary": task_name or "学習タスク（終日）",
+                "description": f"Status: {status}\nNote: {note}",
+                "start": {"date": date_str},
+                "end": {"date": (_parse_date_yyyy_mm_dd(date_str) + timedelta(days=1)).isoformat()},
+                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
+            }
+
+        ev_id = make_event_id(user_id, wbs or "no-wbs", date_str or "no-date")
+        if dry_run:
+            skipped.append({"id": ev_id, "title": body["summary"], "date": date_str})
+            continue
+
+        try:
+            cal.events().insert(
+                calendarId=calendar_id,
+                body=body,
+                eventId=ev_id,
+                sendUpdates="none",
+                conferenceDataVersion=0,
+                supportsAttachments=False,
+                maxAttendees=1,
+                sendNotifications=False,
+                quotaUser=user_id
+            ).execute()
+            created.append({"id": ev_id, "title": body["summary"], "date": date_str})
+        except Exception as e:
+            msg = str(e)
+            if "already exists" in msg or "Duplicate" in msg or "409" in msg:
+                try:
+                    cal.events().update(
+                        calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
+                    ).execute()
+                    updated.append({"id": ev_id, "title": body["summary"], "date": date_str})
+                except Exception as e2:
+                    skipped.append({"id": ev_id, "error": f"update failed: {e2}"})
+            else:
+                skipped.append({"id": ev_id, "error": msg})
+
+    return {
+        "week": week,
+        "calendar_id": calendar_id,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped
+    }
+
+# === New: Register/update specific WBS rows to Calendar ===
+@app.post("/calendar/register_by_wbs", dependencies=[Depends(verify_api_key)])
+def calendar_register_by_wbs(payload: dict = Body(...)):
+    """
+    指定された WBS 行だけを登録/更新。
+    body:
+      {
+        "user_id": "...",
+        "wbs_ids": ["wbs12","wbs13"],
+        "calendar_id": "primary",
+        "dry_run": false
+      }
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    wbs_ids = payload.get("wbs_ids") or []
+    calendar_id = (payload.get("calendar_id") or "primary").strip()
+    dry_run = bool(payload.get("dry_run", False))
+    if not user_id or not wbs_ids:
+        return JSONResponse({"error": "user_id and wbs_ids are required"}, status_code=400)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    try:
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_title = meta["sheets"][0]["properties"]["title"]
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:G10000"
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read sheet: {e}"}, status_code=500)
+
+    values = res.get("values", [])
+    if not values or len(values) < 2:
+        return JSONResponse({"error": "no tasks"}, status_code=404)
+
+    headers = values[0]
+    rows = values[1:]
+
+    target = []
+    wset = set(wbs_ids)
+    for r in rows:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        if (row.get("WBS") or "").strip() in wset:
+            target.append(row)
+    if not target:
+        return JSONResponse({"error": "specified WBS not found"}, status_code=404)
+
+    cal = get_user_calendar_service(user_id)
+    if cal is None:
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent",
+            state=signed_state(user_id)
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Calendar authorization required. Please authorize and retry."
+        }, status_code=200)
+
+    created, updated, skipped = [], [], []
+    for row in target:
+        wbs = (row.get("WBS") or "").strip()
+        date_str = (row.get("Date") or "").strip()
+        task_name = (row.get("Task Name") or "").strip() or (row.get("task") or "").strip()
+        status = (row.get("Status") or "").strip()
+        note = (row.get("Note") or "").strip()
+        start_hhmm = (row.get("Start") or row.get("start") or "").strip()
+        end_hhmm = (row.get("End") or row.get("end") or "").strip()
+
+        duration_min = None
+        try:
+            duration_min = int((row.get("Duration") or "0").strip())
+        except Exception:
+            pass
+
+        start_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), start_hhmm)
+        if start_iso:
+            if end_hhmm:
+                end_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), end_hhmm)
+            else:
+                mins = duration_min if duration_min and duration_min > 0 else 60
+                end_dt = datetime.strptime(f"{date_str} {start_hhmm}", "%Y-%m-%d %H:%M") + timedelta(minutes=mins)
+                end_iso = f"{end_dt.strftime('%Y-%m-%dT%H:%M')}:00{TZ_OFFSET}"
+            body = {
+                "summary": task_name or "学習タスク",
+                "description": f"Status: {status}\nNote: {note}",
+                "start": {"dateTime": start_iso, "timeZone": USER_TZ},
+                "end": {"dateTime": end_iso, "timeZone": USER_TZ},
+                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
+            }
+        else:
+            body = {
+                "summary": task_name or "学習タスク（終日）",
+                "description": f"Status: {status}\nNote: {note}",
+                "start": {"date": date_str},
+                "end": {"date": (_parse_date_yyyy_mm_dd(date_str) + timedelta(days=1)).isoformat()},
+                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
+            }
+
+        ev_id = make_event_id(user_id, wbs or "no-wbs", date_str or "no-date")
+        if dry_run:
+            skipped.append({"id": ev_id, "title": body["summary"], "date": date_str})
+            continue
+
+        try:
+            cal.events().insert(
+                calendarId=calendar_id, body=body, eventId=ev_id, sendUpdates="none"
+            ).execute()
+            created.append({"id": ev_id, "title": body["summary"], "date": date_str})
+        except Exception as e:
+            msg = str(e)
+            if "already exists" in msg or "Duplicate" in msg or "409" in msg:
+                try:
+                    cal.events().update(
+                        calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
+                    ).execute()
+                    updated.append({"id": ev_id, "title": body["summary"], "date": date_str})
+                except Exception as e2:
+                    skipped.append({"id": ev_id, "error": f"update failed: {e2}"})
+            else:
+                skipped.append({"id": ev_id, "error": msg})
+
+    return {
+        "calendar_id": calendar_id,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped
     }
 
 # === New: Backup-only & Regenerate endpoints ===
