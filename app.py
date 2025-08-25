@@ -497,6 +497,85 @@ def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSet
     planner.run_phase2()
     return planner.plan_df, user
 
+# ===== Sheets/GCS ヘルパー =====
+
+def backup_sheet_to_gcs(user_id: str, spreadsheet_id: str, values: List[List[str]]) -> str:
+    """
+    現在のシート内容を CSV にして BACKUP_BUCKET に保存。
+    パス: gpts-plans/{user_id}/backup/{YYYYmmdd_HHMMSS}.csv
+    """
+    client = storage.Client()
+    bucket = client.bucket(BACKUP_BUCKET)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = f"gpts-plans/{user_id}/backup/{ts}.csv"
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    for row in values:
+        writer.writerow(row)
+    blob = bucket.blob(path)
+    blob.upload_from_string(sio.getvalue(), content_type="text/csv")
+    return f"gs://{BACKUP_BUCKET}/{path}"
+
+
+def write_tasks_to_sheet(spreadsheet_id: str, plan_df: pd.DataFrame, user_id: Optional[str] = None) -> None:
+    """
+    plan_df を A1 から全書換え（ヘッダ + データ）。ユーザーOAuthで実行。
+    """
+    service = get_user_sheets_service(user_id) if user_id else None
+    if service is None:
+        raise PermissionError("No OAuth tokens. Authorize first.")
+    # 既存内容クリア（A:F）
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range="A:F"
+    ).execute()
+    # ヘッダ
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range="A1",
+        valueInputOption="RAW",
+        body={"values": [list(plan_df.columns)]}
+    ).execute()
+    # データ
+    if not plan_df.empty:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range="A2",
+            valueInputOption="RAW",
+            body={"values": plan_df.values.tolist()}
+        ).execute()
+
+
+def _safe_int_from_wbs(wbs: str) -> Optional[int]:
+    try:
+        if isinstance(wbs, str) and wbs.startswith("wbs"):
+            return int(wbs[3:])
+    except Exception:
+        pass
+    return None
+
+
+def _next_wbs_id_from_column_a(a_values: List[List[str]]) -> str:
+    """
+    A2:A の wbs から最大値+1 を採番。存在しなければ wbs0。
+    """
+    max_idx = -1
+    for row in a_values:
+        if not row:
+            continue
+        n = _safe_int_from_wbs((row[0] or "").strip())
+        if n is not None and n > max_idx:
+            max_idx = n
+    return f"wbs{max_idx + 1}"
+
+
+def _read_all_values(service, spreadsheet_id: str) -> Tuple[str, List[List[str]]]:
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_title = meta["sheets"][0]["properties"]["title"]
+    res = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F10000"
+    ).execute()
+    return sheet_title, res.get("values", [])
 
 # ===== Sheet I/O =====
 def create_sheet_and_write(plan_df: pd.DataFrame, sheet_title: str, user_id: str) -> str:
@@ -713,3 +792,82 @@ def get_tasks(payload: dict = Body(...)):
         if any((c or "").strip() for c in row)
     ]
     return {"tasks": tasks}
+
+# === New: Backup-only & Regenerate endpoints ===
+
+@app.post("/backup", dependencies=[Depends(verify_api_key)])
+def backup_only(payload: dict = Body(...)):
+    user_id = (payload.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    try:
+        _, values = _read_all_values(svc, spreadsheet_id)
+        if not values:
+            return JSONResponse({"error": "sheet has no data"}, status_code=400)
+        gs_uri = backup_sheet_to_gcs(user_id, spreadsheet_id, values)
+        return {"ok": True, "backup_uri": gs_uri, "rows": len(values)-1}
+    except Exception as e:
+        return JSONResponse({"error": f"backup failed: {e}"}, status_code=500)
+
+
+@app.post("/regenerate", dependencies=[Depends(verify_api_key)])
+def regenerate_and_overwrite(payload: dict = Body(...)):
+    user_id = (payload.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    # 認可
+    if not load_user_credentials(user_id):
+        if not required_envs_ok():
+            return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Please authorize via the URL, then retry."
+        }, status_code=200)
+
+    # 新プラン生成
+    try:
+        plan_df, user = generate_study_plan(payload, user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
+
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    # バックアップ → 上書き
+    try:
+        _, values = _read_all_values(svc, spreadsheet_id)
+        backup_uri = None
+        if values:
+            backup_uri = backup_sheet_to_gcs(user.user_id, spreadsheet_id, values)
+        write_tasks_to_sheet(spreadsheet_id, plan_df, user.user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    return {
+        "ok": True,
+        "backup_uri": backup_uri,
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "plan_preview": plan_df.head(5).to_dict(orient="records")
+    }
