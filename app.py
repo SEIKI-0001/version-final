@@ -1033,6 +1033,120 @@ def insert_task(payload: dict = Body(...)):
         "wbs": inserted_wbs
     }
 
+# === New: Delete task by WBS and renumber ===
+@app.post("/delete_task", dependencies=[Depends(verify_api_key)])
+def delete_task(payload: dict = Body(...)):
+    """
+    指定 WBS 行を物理削除し、その後 A列のWBSを先頭値に合わせて連番で振り直す。
+    （短期: wbs1始まり / 長期: wbs0始まり に自動追従）
+    単一シート前提：常に一枚目のシートを対象。
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    wbs_id = (payload.get("wbs_id") or "").strip()
+    if not user_id or not wbs_id:
+        return JSONResponse({"error": "user_id and wbs_id are required"}, status_code=400)
+
+    # Spreadsheet / service
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+    service = get_user_sheets_service(user_id)
+    if service is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    # シート情報
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet = meta["sheets"][0]  # 単一シート前提
+        sheet_id = sheet["properties"]["sheetId"]
+        sheet_title = sheet["properties"]["title"]
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch sheet metadata: {e}"}, status_code=500)
+
+    # A列（WBS）を取得し、対象行を特定
+    rng = f"{sheet_title}!A2:A10000"
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=rng
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read values: {e}"}, status_code=500)
+
+    values = result.get("values", [])  # [["wbs0"], ["wbs1"], ...]
+    target_row_index_1based = None
+    for i, row in enumerate(values):
+        a = (row[0] if row else "").strip()
+        if a == wbs_id:
+            target_row_index_1based = i + 2  # A2 は行=2
+            break
+    if not target_row_index_1based:
+        return JSONResponse({"error": "WBS ID not found"}, status_code=404)
+
+    # 物理削除（0始まり、endは非包含）
+    start_index_0based = target_row_index_1based - 1
+    end_index_0based = target_row_index_1based
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [{
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": start_index_0based,
+                            "endIndex": end_index_0based
+                        }
+                    }
+                }]
+            }
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Delete failed: {e}"}, status_code=500)
+
+    # 再読込して WBS を振り直し
+    try:
+        result2 = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=rng
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to re-read values: {e}"}, status_code=500)
+
+    a_values = result2.get("values", [])
+    if not a_values:
+        return {
+            "message": "Task deleted (row removed). No remaining tasks to renumber.",
+            "deleted_row": target_row_index_1based
+        }
+
+    def _safe_int_from_wbs(w: str):
+        try:
+            return int((w or "").lower().replace("wbs", "").strip())
+        except Exception:
+            return None
+
+    first = (a_values[0][0] or "").strip()
+    start_num = _safe_int_from_wbs(first)
+    if start_num is None:
+        start_num = 0
+
+    new_wbs_col = [[f"wbs{start_num + i}"] for i in range(len(a_values))]
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_title}!A2:A{len(new_wbs_col)+1}",
+            valueInputOption="RAW",
+            body={"values": new_wbs_col}
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Renumber failed: {e}"}, status_code=500)
+
+    return {
+        "message": "Task deleted (row removed) and WBS renumbered",
+        "deleted_row": target_row_index_1based,
+        "renumber": {"start": start_num, "count": len(new_wbs_col)}
+    }
+
 # === New: Backup-only & Regenerate endpoints ===
 
 @app.post("/backup", dependencies=[Depends(verify_api_key)])
