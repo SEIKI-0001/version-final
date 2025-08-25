@@ -1,4 +1,4 @@
-# ===== Standard library =====
+# ===== Standard Library =====
 import base64
 import csv
 import hashlib
@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 # ===== Third-party =====
 import pandas as pd
-from fastapi import FastAPI, Request, Depends, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -21,33 +21,36 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 from google.cloud import storage
 
-# ====== 環境変数 ======
-USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")
-TZ_OFFSET = os.getenv("TZ_OFFSET", "+09:00")
-BASE_URL = os.getenv("BASE_URL")  # 例: https://version-final-xxxx.a.run.app
+# ===== Configuration (env) =====
+USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
+TZ_OFFSET = os.getenv("TZ_OFFSET", "+09:00")         # 予約（将来のタイムゾーン対応）
+BASE_URL = os.getenv("BASE_URL")                     # 例: https://your-service-xxxx.a.run.app
 OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID")
 OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET")
 APP_SECRET = os.getenv("APP_SECRET", "")
 TOKEN_BUCKET = os.getenv("TOKEN_BUCKET", "gpts-oauth-tokens")
 USER_SHEET_MAP_BUCKET = os.getenv("USER_SHEET_MAP_BUCKET", "user-sheet-mapping")
 USER_SHEET_MAP_BLOB = os.getenv("USER_SHEET_MAP_BLOB", "mapping.json")
-BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup") 
+BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup")
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
-EXEMPT_PATHS = {"/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"}
 BOOK_DATA_BUCKET = os.getenv("BOOK_DATA_BUCKET", "study-book-data")
 
-
-# Google API スコープ（必要最低限：Sheets/Drive.file/Calendar.events）
+# スコープ（当面 Calendar 未使用ならコメントアウト可）
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.events",  # ← 未使用なら外してもOK
 ]
 
-# ====== FastAPI ======
+EXEMPT_PATHS = {"/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"}
+STATE_TTL = 10 * 60  # OAuth state の有効期間（秒）
+DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+# ===== FastAPI =====
 app = FastAPI()
 
-# ====== ヘルスチェック ======
+
+# ===== Health =====
 def required_envs_ok() -> bool:
     return all([BASE_URL, OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, APP_SECRET, TOKEN_BUCKET])
 
@@ -59,10 +62,11 @@ def root():
 def health():
     return {"ok": True, "env_ready": required_envs_ok()}
 
-#　====== api_key認証 ======
+
+# ===== API Key Guard =====
 def verify_api_key(request: Request, authorization: str = Header(None)):
     path = (request.url.path or "/").rstrip("/") or "/"
-    if path in EXEMPT_PATHS:   # OAuth/health は免除
+    if path in EXEMPT_PATHS:
         return
     expected = (SERVICE_API_KEY or "").strip()
     if not expected:
@@ -70,12 +74,11 @@ def verify_api_key(request: Request, authorization: str = Header(None)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(403, "Invalid API key")
     provided = authorization[7:].strip()
-    # タイミング攻撃対策に恒等時間比較
     if not hmac.compare_digest(provided, expected):
         raise HTTPException(403, "Invalid API key")
 
 
-# ====== GCS トークン保存 ======
+# ===== GCS Token Store =====
 def _token_bucket() -> storage.Bucket:
     client = storage.Client()
     return client.bucket(TOKEN_BUCKET)
@@ -85,22 +88,20 @@ def _token_blob_path(user_id: str) -> str:
     return f"tokens/{safe}.json"
 
 def save_refresh_token(user_id: str, refresh_token: str):
-    bucket = _token_bucket()
-    blob = bucket.blob(_token_blob_path(user_id))
+    blob = _token_bucket().blob(_token_blob_path(user_id))
     data = {"user_id": user_id, "refresh_token": refresh_token, "updated_at": int(time.time())}
     blob.upload_from_string(json.dumps(data), content_type="application/json")
 
 def load_refresh_token(user_id: str) -> Optional[str]:
-    bucket = _token_bucket()
-    blob = bucket.blob(_token_blob_path(user_id))
+    blob = _token_bucket().blob(_token_blob_path(user_id))
     if not blob.exists():
         return None
     data = json.loads(blob.download_as_text())
     return data.get("refresh_token")
 
-# ====== OAuth Flow ======
+
+# ===== OAuth Flow =====
 def oauth_redirect_uri() -> str:
-    # 例: https://<cloud-run>/oauth/callback
     base = (BASE_URL or "").rstrip("/")
     return f"{base}/oauth/callback"
 
@@ -114,14 +115,7 @@ def build_flow() -> Flow:
             "redirect_uris": [oauth_redirect_uri()],
         }
     }
-    return Flow.from_client_config(
-        client_config,
-        scopes=SCOPES,
-        redirect_uri=oauth_redirect_uri(),
-    )
-
-# state 署名（改ざん防止 & TTL）
-STATE_TTL = 10 * 60  # 10分
+    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=oauth_redirect_uri())
 
 def signed_state(user_id: str) -> str:
     ts = int(time.time())
@@ -134,38 +128,32 @@ def verify_state(state: str) -> Optional[str]:
     try:
         raw = base64.urlsafe_b64decode(state + "===")
         parts = raw.split(b"|")
-        if len(parts) == 3:
-            user_id = parts[0].decode()
-            ts = int(parts[1].decode())
-            sig_b64 = parts[2]
-            expected = hmac.new(APP_SECRET.encode(), f"{user_id}|{ts}".encode(), hashlib.sha256).digest()
-            if hmac.compare_digest(base64.urlsafe_b64encode(expected), sig_b64):
-                if time.time() - ts <= STATE_TTL:
-                    return user_id
+        if len(parts) != 3:
             return None
-        return None
+        user_id = parts[0].decode()
+        ts = int(parts[1].decode())
+        sig_b64 = parts[2]
+        expected = hmac.new(APP_SECRET.encode(), f"{user_id}|{ts}".encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(base64.urlsafe_b64encode(expected), sig_b64):
+            return None
+        if time.time() - ts > STATE_TTL:
+            return None
+        return user_id
     except Exception:
         return None
 
-# 認可開始
 @app.get("/oauth/start")
 def oauth_start(user_id: Optional[str] = None):
     if not required_envs_ok():
         return JSONResponse({"error": "OAuth env not set"}, status_code=500)
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
-
     flow = build_flow()
-    state = signed_state(user_id)
     auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-        state=state,
+        access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
     )
     return RedirectResponse(auth_url, status_code=302)
 
-# コールバック
 @app.get("/oauth/callback")
 def oauth_callback(request: Request):
     if not required_envs_ok():
@@ -186,7 +174,6 @@ def oauth_callback(request: Request):
         creds = flow.credentials
         rt = getattr(creds, "refresh_token", None)
         if not rt:
-            # Google 側の仕様で返らないことがある → 既存の保存があればOK
             existing = load_refresh_token(user_id)
             if not existing:
                 return HTMLResponse("<h3>⚠️ refresh_token が取得できませんでした。もう一度お試しください。</h3>", status_code=400)
@@ -196,15 +183,12 @@ def oauth_callback(request: Request):
     except Exception as e:
         return HTMLResponse(f"<h3>OAuth error: {e}</h3>", status_code=400)
 
-# 簡易ステータス確認
 @app.get("/auth/status")
 def auth_status(user_id: Optional[str] = None):
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
-    has = bool(load_refresh_token(user_id))
-    return {"user_id": user_id, "authorized": has}
+    return {"user_id": user_id, "authorized": bool(load_refresh_token(user_id))}
 
-#OAuth refresh_token → Credentials 再構築ヘルパー
 def load_user_credentials(user_id: str) -> Optional[UserCredentials]:
     rt = load_refresh_token(user_id)
     if not rt:
@@ -231,6 +215,7 @@ def get_user_sheets_service(user_id: str):
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
+# ===== Study Plan Core =====
 @dataclass
 class UserSetting:
     user_id: str
@@ -253,21 +238,47 @@ class Task:
 
     @property
     def Day(self) -> str:
-        return weekday_abbr(self.Date)
+        return DAY_ABBR[self.Date.weekday()]
 
+# time allocation constants
 MIN1 = 10
 MIN2 = 7
 MIN3 = 5
 
+def weekday_abbr(d: datetime) -> str:
+    return DAY_ABBR[d.weekday()]
+
+def is_weekend(d: datetime) -> bool:
+    return d.weekday() >= 5
+
+def is_rest_day(d: datetime, rest_days: List[str]) -> bool:
+    return weekday_abbr(d) in set(rest_days)
+
 def next_day(d: datetime) -> datetime:
     return d + timedelta(days=1)
+
+def expand_chapter_items(counts: List[int]) -> List[str]:
+    items = []
+    for idx, c in enumerate(counts):
+        for j in range(1, c + 1):
+            items.append(f"Chapter {idx+1} - Item {j}")
+    return items
+
+def load_chapter_data_from_gcs(book_filename: str) -> List[str]:
+    client = storage.Client()
+    bucket = client.bucket(BOOK_DATA_BUCKET)
+    blob = bucket.blob(book_filename)
+    if not blob.exists():
+        raise FileNotFoundError(f"chapter data not found: gs://{BOOK_DATA_BUCKET}/{book_filename}")
+    try:
+        return json.loads(blob.download_as_text())
+    except Exception as e:
+        raise ValueError(f"invalid chapter data: {e}")
 
 def calculate_available_time(user: UserSetting, date: datetime) -> int:
     if is_rest_day(date, user.rest_days):
         return 0
-    if is_weekend(date):
-        return user.weekend_minutes
-    return user.weekday_minutes
+    return user.weekend_minutes if is_weekend(date) else user.weekday_minutes
 
 class StudyPlanner:
     def __init__(self, user: UserSetting, chapter_items_list: List[str]):
@@ -444,7 +455,6 @@ class StudyPlanner:
         self.plan_df.reset_index(drop=True, inplace=True)
         self.plan_df['WBS'] = [f"wbs{i}" for i in range(len(self.plan_df))]
 
-    # フェーズ実行
     def run_phase1(self):
         if not self.is_short:
             self.step0_setup()
@@ -462,6 +472,7 @@ class StudyPlanner:
         self.step8_summarize_tasks()
         self.step9_merge_plan()
 
+
 def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSetting]:
     user = UserSetting(
         user_id=user_id,
@@ -472,54 +483,117 @@ def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSet
         rest_days=data.get("rest_days", ["Wed"]),
         weekday_start=data.get("weekday_start", "20:00"),
         weekend_start=data.get("weekend_start", "13:00"),
-        book_keyword=data["book_keyword"]
+        book_keyword=data["book_keyword"],
     )
-
     chapter_items_list = data.get("chapter_items_list")
     if chapter_items_list:
         if all(isinstance(x, int) for x in chapter_items_list):
             chapter_items_list = expand_chapter_items(chapter_items_list)
     else:
-        book_filename = f"{user.book_keyword}.json"
-        chapter_items_list = load_chapter_data_from_gcs(book_filename)
+        chapter_items_list = load_chapter_data_from_gcs(f"{user.book_keyword}.json")
 
     planner = StudyPlanner(user, chapter_items_list)
-    # 短期/長期に応じた2フェーズ構成
     planner.run_phase1()
     planner.run_phase2()
     return planner.plan_df, user
-    
 
-#====studyplanner置き換え対象====
-def expand_chapter_items(counts: List[int]) -> List[str]:
-    items = []
-    for idx, c in enumerate(counts):
-        for j in range(1, c + 1):
-            items.append(f"Chapter {idx+1} - Item {j}")
-    return items
 
-def load_chapter_data_from_gcs(book_filename: str) -> List[str]:
-    client = storage.Client()
-    bucket = client.bucket(BOOK_DATA_BUCKET)
-    blob = bucket.blob(book_filename)
-    if not blob.exists():
-        raise FileNotFoundError(f"chapter data not found: gs://{BOOK_DATA_BUCKET}/{book_filename}")
+# ===== Sheet I/O =====
+def create_sheet_and_write(plan_df: pd.DataFrame, sheet_title: str, user_id: str) -> str:
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        raise PermissionError("No OAuth tokens. Authorize first.")
+
+    # 新規作成
+    sheet = svc.spreadsheets().create(
+        body={"properties": {"title": sheet_title}}, fields="spreadsheetId"
+    ).execute()
+    spreadsheet_id = sheet.get("spreadsheetId")
+
+    # ヘッダー + データ
+    svc.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id, range="A1", valueInputOption="RAW",
+        body={"values": [list(plan_df.columns)]}
+    ).execute()
+    if not plan_df.empty:
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range="A2", valueInputOption="RAW",
+            body={"values": plan_df.values.tolist()}
+        ).execute()
+
+    # 実シートID取得
+    meta2 = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    first_sheet_id = meta2["sheets"][0]["properties"]["sheetId"]
+
+    # 列幅調整（B列を広げる）
     try:
-        return json.loads(blob.download_as_text())
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [{
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": first_sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 1,   # B (0-based)
+                            "endIndex": 2
+                        },
+                        "properties": {"pixelSize": 210},
+                        "fields": "pixelSize"
+                    }
+                }]
+            }
+        ).execute()
     except Exception as e:
-        raise ValueError(f"invalid chapter data: {e}")
-        
-# ==== Day/Calendar helpers（既存の DAY_ABBR を活用） ====
-DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-def weekday_abbr(d: datetime) -> str:
-    return DAY_ABBR[d.weekday()]
+        print("[warn] 列幅設定に失敗:", e)
 
-def is_weekend(d: datetime) -> bool:
-    return d.weekday() >= 5  # Sat/Sun
+    # 条件付き書式（F列: Status）
+    try:
+        requests = [
+            {
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [{
+                            "sheetId": first_sheet_id,
+                            "startRowIndex": 1,
+                            "startColumnIndex": 5,  # F
+                            "endColumnIndex": 6
+                        }],
+                        "booleanRule": {
+                            "condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": "完了"}]},
+                            "format": {"backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}}
+                        }
+                    },
+                    "index": 0
+                }
+            },
+            {
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [{
+                            "sheetId": first_sheet_id,
+                            "startRowIndex": 1,
+                            "startColumnIndex": 5,
+                            "endColumnIndex": 6
+                        }],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "CUSTOM_FORMULA",
+                                "values": [{"userEnteredValue": '=AND($F2<>"", $F2<>"完了")'}]
+                            },
+                            "format": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.85}}
+                        }
+                    },
+                    "index": 0
+                }
+            }
+        ]
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+    except Exception as e:
+        print("[warn] 条件付き書式の設定に失敗:", e)
 
-def is_rest_day(d: datetime, rest_days: List[str]) -> bool:
-    # 例: ["Wed"] などの省略名で一致
-    return weekday_abbr(d) in set(rest_days)
+    return spreadsheet_id
+
 
 def generate_sheet_title(user: UserSetting) -> str:
     return f"user_{user.user_id}_plan_{user.start_date.strftime('%Y%m%d')}"
@@ -539,9 +613,7 @@ def save_user_sheet_map(mapping: Dict[str, Dict[str, str]]) -> None:
     blob.upload_from_string(json.dumps(mapping, ensure_ascii=False), content_type="application/json")
 
 
-#/generate エンドポイント（FastAPI版）
-from fastapi import Body, Depends
-
+# ===== Endpoints =====
 @app.post("/generate", dependencies=[Depends(verify_api_key)])
 def generate_plan(payload: dict = Body(...)):
     user_id = (payload.get("user_id") or "").strip()
@@ -554,8 +626,7 @@ def generate_plan(payload: dict = Body(...)):
             return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
         flow = build_flow()
         auth_url, _ = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent",
-            state=signed_state(user_id)
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
         )
         return JSONResponse({
             "requires_auth": True,
@@ -574,8 +645,7 @@ def generate_plan(payload: dict = Body(...)):
     except PermissionError:
         flow = build_flow()
         auth_url, _ = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent",
-            state=signed_state(user_id)
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
         )
         return JSONResponse({
             "requires_auth": True,
@@ -601,9 +671,7 @@ def generate_plan(payload: dict = Body(...)):
         "plan": plan_df.to_dict(orient="records")
     }
 
-   
 
-#/get_tasks
 def get_user_spreadsheet_id(user_id: str) -> Optional[str]:
     mapping = load_user_sheet_map()
     if not mapping or user_id not in mapping:
