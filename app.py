@@ -793,6 +793,105 @@ def get_tasks(payload: dict = Body(...)):
     ]
     return {"tasks": tasks}
 
+# === New: Update task fields by WBS (single sheet) ===
+@app.post("/update_task", dependencies=[Depends(verify_api_key)])
+def update_task(payload: dict = Body(...)):
+    """
+    指定 WBS 行の任意フィールドを更新（複数フィールド対応）。単一シート前提。
+    Allowed fields: Task Name, Date, Day, Duration, Status
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    wbs_id = (payload.get("wbs_id") or "").strip()
+    if not user_id or not wbs_id:
+        return JSONResponse({"error": "user_id and wbs_id are required"}, status_code=400)
+
+    # 単発更新 or まとめ更新を正規化
+    updates = payload.get("updates")
+    if not updates:
+        field = (payload.get("field") or "").strip()
+        value = payload.get("value", "")
+        if not field:
+            return JSONResponse({"error": "Specify 'updates' or ('field' and 'value')"}, status_code=400)
+        updates = {field: value}
+
+    # WBS は更新禁止
+    if "wbs" in [k.strip().lower() for k in updates.keys()]:
+        return JSONResponse({"error": "Updating WBS is not allowed."}, status_code=400)
+
+    # スプレッドシート解決
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    # シートタイトル取得
+    try:
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_title = meta["sheets"][0]["properties"]["title"]
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch sheet metadata: {e}"}, status_code=500)
+
+    # フィールド→列マッピング（列名はヘッダに合わせる）
+    FIELD_TO_COL = {
+        "task name": "B",
+        "date": "C",
+        "day": "D",
+        "duration": "E",
+        "status": "F",
+    }
+
+    # 入力キーの正規化と検証
+    normalized_updates = {}
+    for k, v in updates.items():
+        key_norm = (k or "").strip().lower()
+        if key_norm not in FIELD_TO_COL:
+            return JSONResponse(
+                {"error": f"Unknown field '{k}'. Allowed: {list(FIELD_TO_COL.keys())}"},
+                status_code=400
+            )
+        normalized_updates[key_norm] = v
+
+    # WBS 行の検索（A列）
+    try:
+        rng_a = f"{sheet_title}!A2:A10000"
+        got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng_a).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read WBS column: {e}"}, status_code=500)
+
+    values = got.get("values", [])  # [[A2],[A3],...]
+    row_index = None
+    for i, row in enumerate(values):
+        cell = (row[0] if row else "").strip()
+        if cell == wbs_id:
+            row_index = i + 2  # A2=2
+            break
+    if not row_index:
+        return JSONResponse({"error": f"WBS ID '{wbs_id}' not found"}, status_code=404)
+
+    # バッチ更新
+    data_updates = []
+    for field_lc, new_val in normalized_updates.items():
+        col = FIELD_TO_COL[field_lc]
+        a1 = f"{sheet_title}!{col}{row_index}"
+        data_updates.append({"range": a1, "values": [[new_val]]})
+
+    try:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": data_updates}
+        ).execute()
+    except Exception as e:
+        return JSONResponse({"error": f"Update failed: {e}"}, status_code=500)
+
+    return {
+        "message": "Task updated",
+        "row": row_index,
+        "updated_fields": list(normalized_updates.keys())
+    }
+
 # === New: Backup-only & Regenerate endpoints ===
 
 @app.post("/backup", dependencies=[Depends(verify_api_key)])
