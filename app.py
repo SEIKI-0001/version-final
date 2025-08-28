@@ -452,6 +452,31 @@ class StudyPlanner:
                 i += 1
             current_date = next_day(current_date)
 
+    def snapshot_raw_units(self) -> List[Dict[str, object]]:
+        """
+        step8で日別統合する『前』の self.tasks をそのまま JSON 化して返す。
+        /day_off の再配分で利用する。
+        """
+        def _wbs_num(w: str) -> int:
+            try:
+                return int(str(w).replace("wbs", ""))
+            except Exception:
+                return 10**9
+        items = []
+        for t in sorted(self.tasks, key=lambda x: (x.Date, _wbs_num(x.WBS))):
+            items.append({
+                "WBS": t.WBS,
+                "Task": t.Task_Name,
+                "Date": t.Date.strftime("%Y-%m-%d"),
+                "Day": t.Day,
+                "Duration": t.Duration,
+                "Status": t.Status,
+                "meta": {
+                    "round": ("3rd" if "(3rd)" in t.Task_Name else ("2nd" if "(2nd)" in t.Task_Name else "1st")),
+                }
+            })
+        return items
+    
     def step8_summarize_tasks(self):
         from collections import defaultdict
         grouped = defaultdict(list)
@@ -509,11 +534,12 @@ class StudyPlanner:
         if not self.is_short:
             self.step6_refresh_days()
         self.step7_past_exam_plan()
+        raw_units = self.snapshot_raw_units()
         self.step8_summarize_tasks()
         self.step9_merge_plan()
 
 
-def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSetting]:
+def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSetting, List[Dict[str, object]]]:
     user = UserSetting(
         user_id=user_id,
         target_exam=datetime.strptime(data["target_exam_date"], "%Y-%m-%d"),
@@ -533,12 +559,50 @@ def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSet
         chapter_items_list = load_chapter_data_from_gcs(f"{user.book_keyword}.json")
 
     planner = StudyPlanner(user, chapter_items_list)
+    # --- phase 1
     planner.run_phase1()
-    planner.run_phase2()
-    return planner.plan_df, user
+    # --- phase 2 を手動展開（step8直前でスナップショットを取るため）
+    if not planner.is_short:
+        planner.step6_refresh_days()
+    planner.step7_past_exam_plan()
+    
+    raw_units = planner.snapshot_raw_units()
+    # 以降は従来どおりまとめる
+    planner.step8_summarize_tasks()
+    planner.step9_merge_plan()
+
+    return planner.plan_df, user, raw_units
+
+# ===== Raw Plan Units backup (per spreadsheet_id) =====
+def _raw_units_path(user_id: str, spreadsheet_id: str) -> str:
+    # 1プラン=1スプレッドシートを前提に spreadsheet_id をキーに保存
+    return f"gpts-plans/{user_id}/raw/{spreadsheet_id}.json"
+
+def save_raw_plan_units_to_gcs(user_id: str, spreadsheet_id: str, raw_units: List[Dict[str, object]]) -> str:
+    """
+    "最小タスク単位"（統合前の1アイテム=10分/7分/5分や過去問など、step8でまとめる前の全行）を
+    BACKUP_BUCKET に JSON として保存。
+    """
+    client = storage.Client()
+    bucket = client.bucket(BACKUP_BUCKET)
+    path = _raw_units_path(user_id, spreadsheet_id)
+    blob = bucket.blob(path)
+    blob.upload_from_string(json.dumps(raw_units, ensure_ascii=False), content_type="application/json")
+    return f"gs://{BACKUP_BUCKET}/{path}"
+
+def load_raw_plan_units_from_gcs(user_id: str, spreadsheet_id: str) -> Optional[List[Dict[str, object]]]:
+    client = storage.Client()
+    bucket = client.bucket(BACKUP_BUCKET)
+    path = _raw_units_path(user_id, spreadsheet_id)
+    blob = bucket.blob(path)
+    if not blob.exists():
+        return None
+    try:
+        return json.loads(blob.download_as_text())
+    except Exception:
+        return None
 
 # ===== Sheets/GCS ヘルパー =====
-
 def backup_sheet_to_gcs(user_id: str, spreadsheet_id: str, values: List[List[str]]) -> str:
     """
     現在のシート内容を CSV にして BACKUP_BUCKET に保存。
@@ -755,7 +819,7 @@ def generate_plan(payload: dict = Body(...)):
 
     # 生成 → Sheets 書き込み
     try:
-        plan_df, user = generate_study_plan(payload, user_id)
+        plan_df, user, raw_units = generate_study_plan(payload, user_id)  # ← 3値に
     except Exception as e:
         return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
 
@@ -774,8 +838,15 @@ def generate_plan(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
 
+    try:
+        raw_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
+    except Exception as e:
+        print("[warn] save raw units failed:", e)
+        raw_uri = None
+
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
+    
     # マッピング保存（失敗しても続行）
     try:
         mapping = load_user_sheet_map()
@@ -787,6 +858,7 @@ def generate_plan(payload: dict = Body(...)):
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
+        "raw_backup_uri": raw_uri, 
         "plan": plan_df.to_dict(orient="records")
     }
 
@@ -1551,7 +1623,7 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
 
     # 新プラン生成
     try:
-        plan_df, user = generate_study_plan(payload, user_id)
+        plan_df, user, raw_units = generate_study_plan(payload, user_id) 
     except Exception as e:
         return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
 
@@ -1566,13 +1638,22 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
         if values:
             backup_uri = backup_sheet_to_gcs(user.user_id, spreadsheet_id, values)
         write_tasks_to_sheet(spreadsheet_id, plan_df, user.user_id)
+
+        try:
+            raw_backup_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
+        except Exception as e:
+            print("[warn] save raw units failed:", e)
+            raw_backup_uri = None
+
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+        
 
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     return {
         "ok": True,
         "backup_uri": backup_uri,
+        "raw_backup_uri": raw_backup_uri, 
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "plan_preview": plan_df.head(5).to_dict(orient="records")
