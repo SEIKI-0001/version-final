@@ -18,6 +18,7 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 from google.cloud import storage
+from acronyms import router as acronyms_router
 
 # ===== Configuration (env) =====
 USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
@@ -47,6 +48,8 @@ DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 # ===== FastAPI =====
 app = FastAPI()
 
+# ===== acronyms =====
+app.include_router(acronyms_router)
 
 # ===== Health =====
 def required_envs_ok() -> bool:
