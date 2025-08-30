@@ -1658,3 +1658,270 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
         "spreadsheet_url": spreadsheet_url,
         "plan_preview": plan_df.head(5).to_dict(orient="records")
     }
+
+# === Day-off reflow helpers ===
+def _parse_date(s: str):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _wbs_num(w: str) -> int:
+    try:
+        return int(str(w).replace("wbs", "").strip())
+    except Exception:
+        return 10**9
+
+def _is_review_task(name: str) -> bool:
+    n = name or ""
+    return ("復習" in n) or ("アプリ演習" in n)
+
+def _capacity_for_date(d: datetime.date, weekday_minutes: int, weekend_minutes: int,
+                       rest_days: List[str], off_date: datetime.date,
+                       repeat_weekday: bool) -> int:
+    # 明示の休み日
+    if d == off_date:
+        return 0
+    # 固定休み（既存設定 + 今回の曜日を固定化するオプション）
+    abbr = DAY_ABBR[d.weekday()]
+    if abbr in set(rest_days):
+        return 0
+    if repeat_weekday and d.weekday() == off_date.weekday():
+        return 0
+    # それ以外は平日/休日の持ち時間
+    return weekend_minutes if d.weekday() >= 5 else weekday_minutes
+
+def _redistribute_units_after_day_off(
+    raw_units: List[Dict[str, object]],
+    off_date: datetime.date,
+    weekday_minutes: int,
+    weekend_minutes: int,
+    rest_days: List[str],
+    repeat_weekday: bool = False
+) -> List[Dict[str, object]]:
+    """
+    raw_units（step8統合前の最小単位）を、off_date 以降について再配分する。
+    - off_date より前は手を付けない
+    - off_date 当日は容量0
+    - repeat_weekday=True の場合、off_date の曜日を以降ずっと休みにする
+    - 1ユニットの分割はしない（生成時の最小単位を保つ）
+    """
+    def u_date(u):
+        return _parse_date(str(u.get("Date", "")).strip())
+
+    # 安定ソートキー（元の順序を最大限維持）
+    def key(u):
+        return (u_date(u) or datetime(1970,1,1).date(), _wbs_num(str(u.get("WBS","wbs999999"))))
+
+    # 前半（off_date より前）はそのまま、後半（off_date 以降）を再配分
+    before = [u for u in raw_units if (u_date(u) and u_date(u) < off_date)]
+    tail   = [u for u in raw_units if (u_date(u) and u_date(u) >= off_date)]
+    tail.sort(key=key)
+
+    # 再配分開始
+    cur = off_date
+    i = 0
+    reassigned = []
+    while i < len(tail):
+        cap = _capacity_for_date(cur, weekday_minutes, weekend_minutes, rest_days, off_date, repeat_weekday)
+        if cap <= 0:
+            cur = cur + timedelta(days=1)
+            continue
+
+        used = 0
+        while i < len(tail):
+            dur = 0
+            try:
+                dur = int(tail[i].get("Duration", 0))
+            except Exception:
+                dur = 0
+            if dur <= 0:
+                # 異常値はスキップ
+                u = tail[i].copy()
+                u["Date"] = cur.isoformat()
+                reassigned.append(u)
+                i += 1
+                continue
+
+            if used + dur <= cap:
+                u = tail[i].copy()
+                u["Date"] = cur.isoformat()
+                reassigned.append(u)
+                used += dur
+                i += 1
+            else:
+                break  # 次の日へ
+        cur = cur + timedelta(days=1)
+
+    return before + reassigned
+
+def _summarize_units_to_plan_df(units: List[Dict[str, object]]) -> pd.DataFrame:
+    """
+    StudyPlanner.step8/9 と同等の日別まとめを最小限で再現。
+    - 通常タスクは同日内で結合（【1周】/【2周】/【3周】 + first – last）
+    - 「復習」「アプリ演習」は個別に残す
+    """
+    from collections import defaultdict
+
+    # Taskオブジェクト相当を簡易に作る
+    class _T:
+        __slots__ = ("WBS","Task_Name","Date","Duration","Status")
+        def __init__(self, WBS, name, date_str, dur, status):
+            self.WBS = WBS
+            self.Task_Name = name
+            self.Date = datetime.strptime(date_str, "%Y-%m-%d")
+            self.Duration = int(dur) if str(dur).isdigit() else 0
+            self.Status = status or "未着手"
+        @property
+        def Day(self):
+            return DAY_ABBR[self.Date.weekday()]
+
+    tasks = []
+    for u in units:
+        tasks.append(_T(
+            u.get("WBS",""),
+            u.get("Task",""),
+            str(u.get("Date","")).strip(),
+            u.get("Duration",0),
+            u.get("Status","未着手"),
+        ))
+
+    grouped = defaultdict(list)
+    for t in tasks:
+        grouped[t.Date.date()].append(t)
+
+    new_tasks = []
+    for date in sorted(grouped.keys()):
+        day_tasks = grouped[date]
+        normal = [t for t in day_tasks if not _is_review_task(t.Task_Name)]
+        review = [t for t in day_tasks if t not in normal]
+
+        if len(normal) == 1:
+            new_tasks.extend(normal)
+        elif len(normal) > 1:
+            first, last = normal[0], normal[-1]
+            if "(2nd)" in first.Task_Name: lbl = "【2周】"
+            elif "(3rd)" in first.Task_Name: lbl = "【3周】"
+            elif "過去問" not in first.Task_Name and "レビュー" not in first.Task_Name: lbl = "【1周】"
+            else: lbl = ""
+            def clean(n): return n.replace("(2nd) ", "").replace("(3rd) ", "")
+            combined = f"{lbl} {clean(first.Task_Name)} – {clean(last.Task_Name)}".strip()
+            total = sum(t.Duration for t in normal)
+            new_tasks.append(_T("", combined, date.isoformat(), total, "未着手"))
+        new_tasks.extend(review)
+
+    # plan_df 生成 & WBS 連番
+    plan_df = pd.DataFrame([{
+        "WBS": "",
+        "Task Name": t.Task_Name,
+        "Date": t.Date.strftime('%Y-%m-%d'),
+        "Day": t.Day,
+        "Duration": t.Duration,
+        "Status": t.Status
+    } for t in sorted(new_tasks, key=lambda x: x.Date)])
+    if plan_df.empty:
+        plan_df = pd.DataFrame(columns=["WBS","Task Name","Date","Day","Duration","Status"])
+    else:
+        plan_df.reset_index(drop=True, inplace=True)
+        plan_df["WBS"] = [f"wbs{i}" for i in range(len(plan_df))]
+    return plan_df
+
+# === New: Day-off endpoint ===
+@app.post("/day_off", dependencies=[Depends(verify_api_key)])
+def day_off(payload: dict = Body(...)):
+    """
+    指定日のタスクを削除せず『以降に先送り』して再配分する。
+    入力:
+      {
+        "user_id": "...",
+        "off_date": "YYYY-MM-DD",
+        "weekday_minutes": 60,
+        "weekend_minutes": 180,
+        "rest_days": ["Wed"],      # 既存の固定休み（任意）
+        "repeat_weekday": false    # trueなら off_date の曜日を以降ずっと休みに
+      }
+    流れ:
+      1) raw_units を GCS から取得
+      2) off_date 以降を容量計算で再配分
+      3) まとめ直してシート全体を書き換え（WBSは振り直し）
+      4) 新しい raw_units を GCS に保存
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    off_date_str = (payload.get("off_date") or "").strip()
+    if not user_id or not off_date_str:
+        return JSONResponse({"error": "user_id and off_date are required"}, status_code=400)
+
+    weekday_minutes = int(payload.get("weekday_minutes", 60))
+    weekend_minutes = int(payload.get("weekend_minutes", 120))
+    rest_days = payload.get("rest_days") or []
+    repeat_weekday = bool(payload.get("repeat_weekday", False))
+
+    d0 = _parse_date(off_date_str)
+    if not d0:
+        return JSONResponse({"error": "off_date must be 'YYYY-MM-DD'"}, status_code=400)
+
+    # スプレッドシート解決
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        return JSONResponse({"error": "Authorization required"}, status_code=401)
+
+    # raw units 読み込み
+    raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id)
+    if not raw_units:
+        return JSONResponse(
+            {"error": "raw units not found. Please /regenerate or /generate to create raw backup first."},
+            status_code=409
+        )
+
+    # 再配分
+    new_units = _redistribute_units_after_day_off(
+        raw_units=raw_units,
+        off_date=d0,
+        weekday_minutes=weekday_minutes,
+        weekend_minutes=weekend_minutes,
+        rest_days=rest_days,
+        repeat_weekday=repeat_weekday
+    )
+
+    # まとめ直して plan_df を作る
+    plan_df = _summarize_units_to_plan_df(new_units)
+
+    # シート上書き
+    try:
+        write_tasks_to_sheet(spreadsheet_id, plan_df, user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+
+    # raw を上書き保存（次回の day_off に備える）
+    try:
+        raw_backup_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, new_units)
+    except Exception as e:
+        print("[warn] save raw units failed:", e)
+        raw_backup_uri = None
+
+    # サマリーを返却
+    # どれだけ動いたか（分/件）
+    def minutes(xs):
+        s = 0
+        for u in xs:
+            try:
+                s += int(u.get("Duration", 0))
+            except Exception:
+                pass
+        return s
+
+    moved = [u for u in raw_units if _parse_date(u.get("Date","")) >= d0]
+    return {
+        "ok": True,
+        "spreadsheet_id": spreadsheet_id,
+        "raw_backup_uri": raw_backup_uri,
+        "off_date": off_date_str,
+        "repeat_weekday": repeat_weekday,
+        "moved_units_count": len(moved),
+        "moved_minutes_total": minutes(moved),
+        "preview_head": plan_df.head(10).to_dict(orient="records")
+    }
+
