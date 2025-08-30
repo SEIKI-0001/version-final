@@ -18,6 +18,7 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 from google.cloud import storage
+import random
 
 # ===== Configuration (env) =====
 USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
@@ -32,6 +33,12 @@ USER_SHEET_MAP_BLOB = os.getenv("USER_SHEET_MAP_BLOB", "mapping.json")
 BACKUP_BUCKET = os.getenv("BACKUP_BUCKET", "gpts-plans-backup")
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
 BOOK_DATA_BUCKET = os.getenv("BOOK_DATA_BUCKET", "study-book-data")
+
+ACRONYM_BUCKET = os.getenv("ACRONYM_BUCKET", "maru-acronyms")
+ACRONYM_PATH = os.getenv("ACRONYM_PATH", "acronyms/itpass_core.json")
+ACRONYM_REFRESH_SEC = int(os.getenv("ACRONYM_REFRESH_SEC", "3600"))
+
+_AC_CACHE = {"terms": {}, "last": 0, "etag": None}
 
 # スコープ（当面 Calendar 未使用ならコメントアウト可）
 SCOPES = [
@@ -1952,3 +1959,85 @@ def day_off(payload: dict = Body(...)):
         "preview_head": plan_df.head(10).to_dict(orient="records")
     }
 
+def _ac_load_from_gcs(force: bool = False):
+    """GCS から略語辞書を読み込み、メモリキャッシュする。"""
+    now = time.time()
+    if not force and (now - _AC_CACHE["last"] < ACRONYM_REFRESH_SEC) and _AC_CACHE["terms"]:
+        return
+    cli = storage.Client()
+    blob = cli.bucket(ACRONYM_BUCKET).blob(ACRONYM_PATH)
+
+    # 変更検知（ETag）
+    blob.reload()
+    etag = getattr(blob, "etag", None)
+    if not force and _AC_CACHE["etag"] and etag == _AC_CACHE["etag"]:
+        _AC_CACHE["last"] = now
+        return
+
+    data = blob.download_as_text()
+    obj = json.loads(data)  # 形式: { "DNS": { ...AcronymCard... }, "SMTP": {...}, ... }
+
+    terms = {}
+    for k, card in obj.items():
+        key = (k or "").upper()
+        if not key:
+            continue
+        terms[key] = card
+
+    _AC_CACHE["terms"] = terms
+    _AC_CACHE["last"] = now
+    _AC_CACHE["etag"] = etag
+
+def _ac_get(term: str):
+    _ac_load_from_gcs()
+    return _AC_CACHE["terms"].get((term or "").upper())
+
+@app.get("/acronyms/{term}", dependencies=[Depends(verify_api_key)])
+def get_acronym_card(term: str):
+    """
+    単語カード1件を返す（APIキーのみ、OAuth不要 → ポップアップ無し）
+    例: GET /acronyms/DNS
+    """
+    card = _ac_get(term)
+    if not card:
+        raise HTTPException(status_code=404, detail="Term not found")
+    resp = JSONResponse(card)
+    # 軽いHTTPキャッシュ（任意）
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    if _AC_CACHE["etag"]:
+        resp.headers["ETag"] = _AC_CACHE["etag"]
+    return resp
+
+@app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)])
+def get_acronym_batch(payload: dict = Body(...)):
+    """
+    指定した用語の配列をまとめて返す
+    body: { "terms": ["DNS","SMTP","DHCP"] }
+    """
+    terms = payload.get("terms") or []
+    if not isinstance(terms, list):
+        return JSONResponse({"error": "terms must be an array"}, status_code=400)
+    _ac_load_from_gcs()
+    out = []
+    for t in terms:
+        c = _AC_CACHE["terms"].get((t or "").upper())
+        if c:
+            out.append(c)
+    return {"cards": out, "count": len(out), "etag": _AC_CACHE["etag"]}
+
+@app.get("/acronyms/session", dependencies=[Depends(verify_api_key)])
+def get_acronym_session(count: int = 10, shuffle: bool = True):
+    """
+    学習用に複数カードをまとめて返す（デフォルト10件）
+    例: GET /acronyms/session?count=10
+    """
+    if count < 1:
+        count = 1
+    if count > 30:
+        count = 30
+    _ac_load_from_gcs()
+    items = list(_AC_CACHE["terms"].values())
+    if shuffle:
+        random.shuffle(items)
+    picked = items[:count]
+    return {"cards": picked, "count": len(picked), "etag": _AC_CACHE["etag"]}
