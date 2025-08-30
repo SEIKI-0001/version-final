@@ -1,9 +1,7 @@
 # ===== Standard Library =====
 import base64
-import csv
 import hashlib
 import hmac
-import io
 import json
 import os
 import time
@@ -602,25 +600,41 @@ def load_raw_plan_units_from_gcs(user_id: str, spreadsheet_id: str) -> Optional[
     except Exception:
         return None
 
-# ===== Sheets/GCS ヘルパー =====
-def backup_sheet_to_gcs(user_id: str, spreadsheet_id: str, values: List[List[str]]) -> str:
+# === URL-backup helpers ===
+def _url_backup_object_name(user_id: str) -> str:
+    return f"gpts-plans/{user_id}/history/url_backups.jsonl"
+
+def append_url_backup(user_id: str, spreadsheet_id: str, spreadsheet_url: str, note: str = "") -> str:
     """
-    現在のシート内容を CSV にして BACKUP_BUCKET に保存。
-    パス: gpts-plans/{user_id}/backup/{YYYYmmdd_HHMMSS}.csv
+    シートURLの履歴を JSONL で1行追記する。
+    例: gs://{BACKUP_BUCKET}/gpts-plans/{user_id}/history/url_backups.jsonl
     """
     client = storage.Client()
     bucket = client.bucket(BACKUP_BUCKET)
+    obj = _url_backup_object_name(user_id)
+    blob = bucket.blob(obj)
+
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    path = f"gpts-plans/{user_id}/backup/{ts}.csv"
-    sio = io.StringIO()
-    writer = csv.writer(sio)
-    for row in values:
-        writer.writerow(row)
-    blob = bucket.blob(path)
-    blob.upload_from_string(sio.getvalue(), content_type="text/csv")
-    return f"gs://{BACKUP_BUCKET}/{path}"
+    rec = json.dumps({
+        "ts": ts,
+        "user_id": user_id,
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "note": note
+    }, ensure_ascii=False) + "\n"
 
+    if blob.exists():
+        # compose で安全に追記
+        tmp_name = f"{obj}.tmp.{ts}"
+        tmp_blob = bucket.blob(tmp_name)
+        tmp_blob.upload_from_string(rec, content_type="application/json")
+        blob.compose([blob, tmp_blob])
+        tmp_blob.delete()
+    else:
+        blob.upload_from_string(rec, content_type="application/json")
+    return f"gs://{BACKUP_BUCKET}/{obj}"
 
+# ===== Sheets/GCS ヘルパー =====
 def write_tasks_to_sheet(spreadsheet_id: str, plan_df: pd.DataFrame, user_id: Optional[str] = None) -> None:
     """
     plan_df を A1 から全書換え（ヘッダ + データ）。ユーザーOAuthで実行。
@@ -648,38 +662,6 @@ def write_tasks_to_sheet(spreadsheet_id: str, plan_df: pd.DataFrame, user_id: Op
             valueInputOption="RAW",
             body={"values": plan_df.values.tolist()}
         ).execute()
-
-
-def _safe_int_from_wbs(wbs: str) -> Optional[int]:
-    try:
-        if isinstance(wbs, str) and wbs.startswith("wbs"):
-            return int(wbs[3:])
-    except Exception:
-        pass
-    return None
-
-
-def _next_wbs_id_from_column_a(a_values: List[List[str]]) -> str:
-    """
-    A2:A の wbs から最大値+1 を採番。存在しなければ wbs0。
-    """
-    max_idx = -1
-    for row in a_values:
-        if not row:
-            continue
-        n = _safe_int_from_wbs((row[0] or "").strip())
-        if n is not None and n > max_idx:
-            max_idx = n
-    return f"wbs{max_idx + 1}"
-
-
-def _read_all_values(service, spreadsheet_id: str) -> Tuple[str, List[List[str]]]:
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheet_title = meta["sheets"][0]["properties"]["title"]
-    res = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F10000"
-    ).execute()
-    return sheet_title, res.get("values", [])
 
 # ===== Sheet I/O =====
 def create_sheet_and_write(plan_df: pd.DataFrame, sheet_title: str, user_id: str) -> str:
@@ -1571,11 +1553,11 @@ def calendar_register_by_wbs(payload: dict = Body(...)):
         "skipped": skipped
     }
 
-# === New: Backup-only & Regenerate endpoints ===
-
+# === URL history backup & Regenerate ===
 @app.post("/backup", dependencies=[Depends(verify_api_key)])
 def backup_only(payload: dict = Body(...)):
     user_id = (payload.get("user_id") or "").strip()
+    note = (payload.get("note") or "").strip()
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
 
@@ -1583,19 +1565,64 @@ def backup_only(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
-    svc = get_user_sheets_service(user_id)
-    if svc is None:
-        return JSONResponse({"error": "Authorization required"}, status_code=401)
-
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     try:
-        _, values = _read_all_values(svc, spreadsheet_id)
-        if not values:
-            return JSONResponse({"error": "sheet has no data"}, status_code=400)
-        gs_uri = backup_sheet_to_gcs(user_id, spreadsheet_id, values)
-        return {"ok": True, "backup_uri": gs_uri, "rows": len(values)-1}
+        hist_uri = append_url_backup(user_id, spreadsheet_id, spreadsheet_url, note=note)
+        return {
+            "ok": True,
+            "history_uri": hist_uri,
+            "spreadsheet_id": spreadsheet_id,
+            "spreadsheet_url": spreadsheet_url
+        }
     except Exception as e:
         return JSONResponse({"error": f"backup failed: {e}"}, status_code=500)
 
+@app.get("/backup/list", dependencies=[Depends(verify_api_key)])
+def list_url_backups(user_id: str):
+    """
+    URLバックアップ履歴を返す（新しい順）
+    """
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    client = storage.Client()
+    bucket = client.bucket(BACKUP_BUCKET)
+    obj = _url_backup_object_name(user_id)
+    blob = bucket.blob(obj)
+    if not blob.exists():
+        return {"items": []}
+
+    try:
+        lines = blob.download_as_text().splitlines()
+        items = [json.loads(x) for x in lines if x.strip()]
+        items.sort(key=lambda r: r.get("ts", ""), reverse=True)
+        return {"items": items}
+    except Exception as e:
+        return JSONResponse({"error": f"list failed: {e}"}, status_code=500)
+
+
+@app.post("/backup/switch_active", dependencies=[Depends(verify_api_key)])
+def switch_active_sheet(payload: dict = Body(...)):
+    """
+    履歴にある spreadsheet_id を「現行」として mapping.json を更新する。
+    body: { "user_id":"...", "spreadsheet_id":"..." }
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    spreadsheet_id = (payload.get("spreadsheet_id") or "").strip()
+    if not user_id or not spreadsheet_id:
+        return JSONResponse({"error": "user_id and spreadsheet_id are required"}, status_code=400)
+
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    try:
+        mapping = load_user_sheet_map()
+        mapping[user_id] = {
+            "spreadsheet_id": spreadsheet_id,
+            "spreadsheet_url": spreadsheet_url
+        }
+        save_user_sheet_map(mapping)
+        return {"ok": True, "spreadsheet_id": spreadsheet_id, "spreadsheet_url": spreadsheet_url}
+    except Exception as e:
+        return JSONResponse({"error": f"switch failed: {e}"}, status_code=500)
 
 @app.post("/regenerate", dependencies=[Depends(verify_api_key)])
 def regenerate_and_overwrite(payload: dict = Body(...)):
@@ -1623,7 +1650,7 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
 
     # 新プラン生成
     try:
-        plan_df, user, raw_units = generate_study_plan(payload, user_id) 
+        plan_df, user, raw_units = generate_study_plan(payload, user_id)
     except Exception as e:
         return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
 
@@ -1631,29 +1658,30 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
     if svc is None:
         return JSONResponse({"error": "Authorization required"}, status_code=401)
 
-    # バックアップ → 上書き
+    # ←← ここから下を関数内にインデント！
+    # 上書き前に「URL履歴」を追記（CSVバックアップは行わない）
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     try:
-        _, values = _read_all_values(svc, spreadsheet_id)
-        backup_uri = None
-        if values:
-            backup_uri = backup_sheet_to_gcs(user.user_id, spreadsheet_id, values)
-        write_tasks_to_sheet(spreadsheet_id, plan_df, user.user_id)
+        history_uri = append_url_backup(user.user_id, spreadsheet_id, spreadsheet_url, note="regenerate-before-overwrite")
+    except Exception as e:
+        print("[warn] append_url_backup failed:", e)
+        history_uri = None
 
+    # シート上書き ＋ raw_units を保存
+    try:
+        write_tasks_to_sheet(spreadsheet_id, plan_df, user.user_id)
         try:
             raw_backup_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
         except Exception as e:
             print("[warn] save raw units failed:", e)
             raw_backup_uri = None
-
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
-        
 
-    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     return {
         "ok": True,
-        "backup_uri": backup_uri,
-        "raw_backup_uri": raw_backup_uri, 
+        "history_uri": history_uri,
+        "raw_backup_uri": raw_backup_uri,
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "plan_preview": plan_df.head(5).to_dict(orient="records")
