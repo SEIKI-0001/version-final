@@ -57,23 +57,32 @@ DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 app = FastAPI()
 
 # ===== 追加: Pydantic models =====
+try:
+    # pydantic v2
+    from pydantic import ConfigDict
+    V2 = True
+except Exception:
+    V2 = False
+
 class AcronymSource(BaseModel):
     title: str | None = None
     url: AnyUrl | None = None
 
 class AcronymCardModel(BaseModel):
+    # v2 なら追加:
+    if 'V2' in globals() and V2:
+        model_config = ConfigDict(extra='allow')
+    # v1 ならこの内側に Config クラス:
+    class Config:
+        extra = 'allow'
+
     term: str | None = None
     title: str | None = None
     description: str | None = None
     details: dict[str, Any] | None = None
     tags: list[str] | None = None
     sources: list[AcronymSource] | None = None
-
-class AcronymCardsResponseModel(BaseModel):
-    cards: list[AcronymCardModel]
-    count: int
-    etag: str | None = None
-
+    
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
