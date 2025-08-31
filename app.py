@@ -19,6 +19,8 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 from google.cloud import storage
 import random
+from pydantic import BaseModel, AnyUrl
+from typing import Any
 
 # ===== Configuration (env) =====
 USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
