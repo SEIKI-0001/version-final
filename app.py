@@ -21,6 +21,7 @@ from google.cloud import storage
 import random
 from pydantic import BaseModel, AnyUrl
 from typing import Any
+from fastapi.openapi.utils import get_openapi
 
 # ===== Configuration (env) =====
 USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
@@ -55,6 +56,48 @@ DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # ===== FastAPI =====
 app = FastAPI()
+
+# ===== 追加: Pydantic models =====
+from pydantic import BaseModel, AnyUrl
+from typing import Any
+
+class AcronymSource(BaseModel):
+    title: str | None = None
+    url: AnyUrl | None = None
+
+class AcronymCardModel(BaseModel):
+    term: str | None = None
+    title: str | None = None
+    description: str | None = None
+    details: dict[str, Any] | None = None
+    tags: list[str] | None = None
+    sources: list[AcronymSource] | None = None
+
+class AcronymCardsResponseModel(BaseModel):
+    cards: list[AcronymCardModel]
+    count: int
+    etag: str | None = None
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title="Study Plan API",
+        version="1.5.0",
+        description="",
+        routes=app.routes,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["ServiceBearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API Key",
+    }
+    # 全体に適用（各パスに 'authorization' ヘッダが必須だと解釈される）
+    schema["security"] = [{"ServiceBearer": []}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
 
 # ===== Health =====
 def required_envs_ok() -> bool:
@@ -2059,7 +2102,8 @@ def _ac_get(term: str):
     _ac_load_from_gcs()
     return _AC_CACHE["terms"].get((term or "").upper())
 
-@app.get("/acronyms/{term}", dependencies=[Depends(verify_api_key)])
+@app.get("/acronyms/{term}", dependencies=[Depends(verify_api_key)],
+         response_model=AcronymCardModel))
 def get_acronym_card(term: str):
     """
     単語カード1件を返す（APIキーのみ、OAuth不要 → ポップアップ無し）
@@ -2075,7 +2119,8 @@ def get_acronym_card(term: str):
         resp.headers["ETag"] = _AC_CACHE["etag"]
     return resp
 
-@app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)])
+@app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)],
+         response_model=AcronymCardModel))
 def get_acronym_batch(payload: dict = Body(...)):
     """
     指定した用語の配列をまとめて返す
@@ -2092,7 +2137,8 @@ def get_acronym_batch(payload: dict = Body(...)):
             out.append(c)
     return {"cards": out, "count": len(out), "etag": _AC_CACHE["etag"]}
 
-@app.get("/acronyms/session", dependencies=[Depends(verify_api_key)])
+@app.get("/acronyms/session", dependencies=[Depends(verify_api_key)],
+         response_model=AcronymCardsResponseModel)
 def get_acronym_session(count: int = 10, shuffle: bool = True):
     """
     学習用に複数カードをまとめて返す（デフォルト10件）
