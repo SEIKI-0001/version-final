@@ -58,8 +58,7 @@ app = FastAPI()
 
 # ===== 追加: Pydantic models =====
 try:
-    # pydantic v2
-    from pydantic import ConfigDict
+    from pydantic import ConfigDict  # v2
     V2 = True
 except Exception:
     V2 = False
@@ -69,19 +68,27 @@ class AcronymSource(BaseModel):
     url: AnyUrl | None = None
 
 class AcronymCardModel(BaseModel):
-    # v2 なら追加:
-    if 'V2' in globals() and V2:
+    if V2:
         model_config = ConfigDict(extra='allow')
-    # v1 ならこの内側に Config クラス:
-    class Config:
-        extra = 'allow'
-
+    else:
+        class Config:
+            extra = 'allow'
     term: str | None = None
     title: str | None = None
     description: str | None = None
     details: dict[str, Any] | None = None
     tags: list[str] | None = None
     sources: list[AcronymSource] | None = None
+
+class AcronymCardsResponseModel(BaseModel):
+    if V2:
+        model_config = ConfigDict(extra='allow')
+    else:
+        class Config:
+            extra = 'allow'
+    cards: list[AcronymCardModel]
+    count: int
+    etag: str | None = None
     
 def custom_openapi():
     if app.openapi_schema:
@@ -2107,43 +2114,6 @@ def _ac_get(term: str):
     _ac_load_from_gcs()
     return _AC_CACHE["terms"].get((term or "").upper())
 
-@app.get("/acronyms/term/{term}", dependencies=[Depends(verify_api_key)])
-def get_acronym_card(term: str):
-    """
-    単語カード1件を返す（APIキーのみ、OAuth不要 → ポップアップ無し）
-    例: GET /acronyms/DNS
-    """
-    card = _ac_get(term)
-    if not card:
-        raise HTTPException(status_code=404, detail="Term not found")
-    resp = JSONResponse(card)
-    # 軽いHTTPキャッシュ（任意）
-    resp.headers["Cache-Control"] = "public, max-age=3600"
-    if _AC_CACHE["etag"]:
-        resp.headers["ETag"] = _AC_CACHE["etag"]
-    return resp
-
-@app.get("/acronyms/{term}", include_in_schema=False)
-def legacy_acronym_card(term: str):
-    return RedirectResponse(url=f"/acronyms/term/{term}", status_code=307)
-    
-@app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)],
-         response_model=AcronymCardsResponseModel)
-def get_acronym_batch(payload: dict = Body(...)):
-    """
-    指定した用語の配列をまとめて返す
-    body: { "terms": ["DNS","SMTP","DHCP"] }
-    """
-    terms = payload.get("terms") or []
-    if not isinstance(terms, list):
-        return JSONResponse({"error": "terms must be an array"}, status_code=400)
-    _ac_load_from_gcs()
-    out = []
-    for t in terms:
-        c = _AC_CACHE["terms"].get((t or "").upper())
-        if c:
-            out.append(c)
-    return {"cards": out, "count": len(out), "etag": _AC_CACHE["etag"]}
 
 @app.get("/acronyms/session", dependencies=[Depends(verify_api_key)],
          response_model=AcronymCardsResponseModel)
@@ -2202,4 +2172,47 @@ def register_book_chapters(payload: dict = Body(...)):
         return JSONResponse({"error": f"save failed: {e}"}, status_code=500)
 
     return {"ok": True, "book_keyword": book_keyword, "gcs_uri": f"gs://{BOOK_DATA_BUCKET}/{book_keyword}.json", "count": len(items)}
+
+@app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)],
+          response_model=AcronymCardsResponseModel)
+def get_acronym_batch(payload: dict = Body(...)):
+    """
+    指定した用語の配列をまとめて返す
+    body: { "terms": ["DNS","SMTP","DHCP"] }
+    """
+    terms = payload.get("terms") or []
+    if not isinstance(terms, list):
+        return JSONResponse({"error": "terms must be an array"}, status_code=400)
+    _ac_load_from_gcs()
+    out = []
+    for t in terms:
+        c = _AC_CACHE["terms"].get((t or "").upper())
+        if c:
+            out.append(c)
+    return {"cards": out, "count": len(out), "etag": _AC_CACHE["etag"]}
+
+@app.get("/acronyms/term/{term}",
+         dependencies=[Depends(verify_api_key)],
+         response_model=AcronymCardModel)
+def get_acronym_card(term: str):
+    """
+    単語カード1件を返す（APIキーのみ、OAuth不要）
+    例: GET /acronyms/term/DNS
+    """
+    card = _ac_get(term)
+    if not card:
+        raise HTTPException(status_code=404, detail="Term not found")
+    resp = JSONResponse(card)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    if _AC_CACHE["etag"]:
+        resp.headers["ETag"] = _AC_CACHE["etag"]
+    return resp
+
+@app.get("/acronyms/{term}", include_in_schema=False,
+         dependencies=[Depends(verify_api_key)])
+def acronyms_compat(term: str):
+    # 予約語はここでは扱わない（静的ルートへ回す）
+    if term in {"session", "batch", "term"}:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return RedirectResponse(url=f"/acronyms/term/{term}", status_code=307)
 
