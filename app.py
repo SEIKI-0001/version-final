@@ -259,6 +259,83 @@ def make_event_id(user_id: str, wbs: str, date_str: str) -> str:
     h = hashlib.sha1(raw).hexdigest()
     return f"gpts-{h}"
 
+# === Chapter items helpers (add) ===
+def expand_chapter_items_named(counts: List[int], titles: Optional[List[str]] = None) -> List[str]:
+    """
+    counts: 各章の項目数 [12, 10, 8, ...]
+    titles: 章タイトル（任意） ["第1章 戦略", "第2章 マネジメント", ...]
+    返り値: ["Chapter 1 - Item 1", ...] または ["第1章 戦略 - Item 1", ...]
+    """
+    items = []
+    for i, c in enumerate(counts):
+        base = titles[i].strip() if (titles and i < len(titles) and titles[i]) else f"Chapter {i+1}"
+        for j in range(1, int(c) + 1):
+            items.append(f"{base} - Item {j}")
+    return items
+
+def _load_chapter_items_from_gcs_or_none(book_filename: str) -> Optional[List[str]]:
+    """
+    GCS に {BOOK_DATA_BUCKET}/{book_filename} があれば JSON を返し、無ければ None。
+    JSON は ["Chapter 1 - Item 1", ...] のリスト想定。
+    """
+    client = storage.Client()
+    bucket = client.bucket(BOOK_DATA_BUCKET)
+    blob = bucket.blob(book_filename)
+    if not blob.exists():
+        return None
+    try:
+        return json.loads(blob.download_as_text())
+    except Exception as e:
+        raise ValueError(f"invalid chapter data: {e}")
+
+def _normalize_chapter_items(data: dict, book_keyword: str) -> List[str]:
+    """
+    優先順:
+      1) payload で明示された章情報（複数形式対応）
+      2) GCS の book_keyword.json
+      3) どちらも無ければ 400
+    サポートする payload 形式:
+      - chapter_items_list: 既存仕様
+          a) [int,int,...] -> expand
+          b) [str,str,...] -> そのまま項目名として採用
+      - chapter_counts: [int,int,...] 章ごとの項目数
+      - chapters: [{title: "...", count: 12}, ...] 章タイトル＋項目数
+    """
+    # 1) payload 最優先
+    if "chapter_items_list" in data and data["chapter_items_list"]:
+        xs = data["chapter_items_list"]
+        # ints の配列なら展開、strings の配列ならそのまま採用
+        if all(isinstance(x, int) for x in xs):
+            return expand_chapter_items(xs)
+        if all(isinstance(x, str) for x in xs):
+            return xs
+        raise ValueError("chapter_items_list must be an array of integers or strings")
+
+    if "chapter_counts" in data and data["chapter_counts"]:
+        counts = [int(x) for x in data["chapter_counts"]]
+        return expand_chapter_items_named(counts)
+
+    if "chapters" in data and data["chapters"]:
+        # ex: [{"title":"第1章 戦略","count":10}, {"title":"第2章 ...","count":12}]
+        ch = data["chapters"]
+        counts = []
+        titles = []
+        for obj in ch:
+            counts.append(int(obj.get("count", 0)))
+            titles.append(str(obj.get("title") or "").strip() or None)
+        return expand_chapter_items_named(counts, titles)
+
+    # 2) GCS フォールバック
+    gcs = _load_chapter_items_from_gcs_or_none(f"{book_keyword}.json")
+    if gcs:
+        return gcs
+
+    # 3) エラー
+    raise ValueError(
+        "Chapter data not found. Provide one of: chapter_items_list (ints or strings), "
+        "chapter_counts (ints), or chapters ([{title,count},...])."
+    )
+
 # ===== Study Plan Core =====
 @dataclass
 class UserSetting:
@@ -307,17 +384,6 @@ def expand_chapter_items(counts: List[int]) -> List[str]:
         for j in range(1, c + 1):
             items.append(f"Chapter {idx+1} - Item {j}")
     return items
-
-def load_chapter_data_from_gcs(book_filename: str) -> List[str]:
-    client = storage.Client()
-    bucket = client.bucket(BOOK_DATA_BUCKET)
-    blob = bucket.blob(book_filename)
-    if not blob.exists():
-        raise FileNotFoundError(f"chapter data not found: gs://{BOOK_DATA_BUCKET}/{book_filename}")
-    try:
-        return json.loads(blob.download_as_text())
-    except Exception as e:
-        raise ValueError(f"invalid chapter data: {e}")
 
 def calculate_available_time(user: UserSetting, date: datetime) -> int:
     if is_rest_day(date, user.rest_days):
@@ -555,14 +621,13 @@ def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSet
         weekend_start=data.get("weekend_start", "13:00"),
         book_keyword=data["book_keyword"],
     )
-    chapter_items_list = data.get("chapter_items_list")
-    if chapter_items_list:
-        if all(isinstance(x, int) for x in chapter_items_list):
-            chapter_items_list = expand_chapter_items(chapter_items_list)
-    else:
-        chapter_items_list = load_chapter_data_from_gcs(f"{user.book_keyword}.json")
+    try:
+        chapter_items_list = _normalize_chapter_items(data, user.book_keyword)
+    except Exception as e:
+        raise ValueError(f"chapter items error: {e}")
 
     planner = StudyPlanner(user, chapter_items_list)
+    
     # --- phase 1
     planner.run_phase1()
     # --- phase 2 を手動展開（step8直前でスナップショットを取るため）
@@ -2041,3 +2106,44 @@ def get_acronym_session(count: int = 10, shuffle: bool = True):
         random.shuffle(items)
     picked = items[:count]
     return {"cards": picked, "count": len(picked), "etag": _AC_CACHE["etag"]}
+
+@app.post("/books/register", dependencies=[Depends(verify_api_key)])
+def register_book_chapters(payload: dict = Body(...)):
+    """
+    任意の書籍キーワードに対応する章データ（項目名の配列）を GCS に保存する。
+    body 例:
+      {
+        "book_keyword": "kayanoki",
+        # 以下のいずれか:
+        "chapter_items_list": [12, 10, 8],       # ints -> 展開 / strings -> そのまま
+        "chapter_counts": [12, 10, 8],           # ints
+        "chapters": [{"title":"第1章 戦略","count":12}, ...],
+        "overwrite": false
+      }
+    保存形式:
+      gs://{BOOK_DATA_BUCKET}/{book_keyword}.json に ["Chapter 1 - Item 1", ...] の配列として保存
+    """
+    book_keyword = (payload.get("book_keyword") or "").strip()
+    if not book_keyword:
+        return JSONResponse({"error": "book_keyword is required"}, status_code=400)
+
+    try:
+        items = _normalize_chapter_items(payload, book_keyword)
+    except Exception as e:
+        return JSONResponse({"error": f"chapter items error: {e}"}, status_code=400)
+
+    overwrite = bool(payload.get("overwrite", False))
+    client = storage.Client()
+    bucket = client.bucket(BOOK_DATA_BUCKET)
+    blob = bucket.blob(f"{book_keyword}.json")
+
+    if blob.exists() and not overwrite:
+        return JSONResponse({"error": "already exists. set overwrite=true to replace."}, status_code=409)
+
+    try:
+        blob.upload_from_string(json.dumps(items, ensure_ascii=False), content_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": f"save failed: {e}"}, status_code=500)
+
+    return {"ok": True, "book_keyword": book_keyword, "gcs_uri": f"gs://{BOOK_DATA_BUCKET}/{book_keyword}.json", "count": len(items)}
+
