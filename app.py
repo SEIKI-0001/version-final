@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any
 
 # ===== Third-party =====
 import pandas as pd
@@ -20,7 +20,6 @@ from google_auth_oauthlib.flow import Flow
 from google.cloud import storage
 import random
 from pydantic import BaseModel, AnyUrl
-from typing import Any
 from fastapi.openapi.utils import get_openapi
 
 # ===== Configuration (env) =====
@@ -2103,7 +2102,7 @@ def _ac_get(term: str):
     return _AC_CACHE["terms"].get((term or "").upper())
 
 @app.get("/acronyms/{term}", dependencies=[Depends(verify_api_key)],
-         response_model=AcronymCardModel))
+         response_model=AcronymCardModel)
 def get_acronym_card(term: str):
     """
     単語カード1件を返す（APIキーのみ、OAuth不要 → ポップアップ無し）
@@ -2120,7 +2119,7 @@ def get_acronym_card(term: str):
     return resp
 
 @app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)],
-         response_model=AcronymCardModel))
+         response_model=AcronymCardModel)
 def get_acronym_batch(payload: dict = Body(...)):
     """
     指定した用語の配列をまとめて返す
