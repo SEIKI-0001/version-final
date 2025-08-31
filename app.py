@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Optional, List, Tuple, Dict
 
 # ===== Third-party =====
 import pandas as pd
@@ -57,9 +57,6 @@ DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 app = FastAPI()
 
 # ===== 追加: Pydantic models =====
-from pydantic import BaseModel, AnyUrl
-from typing import Any
-
 class AcronymSource(BaseModel):
     title: str | None = None
     url: AnyUrl | None = None
@@ -2119,7 +2116,7 @@ def get_acronym_card(term: str):
     return resp
 
 @app.post("/acronyms/batch", dependencies=[Depends(verify_api_key)],
-         response_model=AcronymCardModel)
+         response_model=AcronymCardsResponseModel)
 def get_acronym_batch(payload: dict = Body(...)):
     """
     指定した用語の配列をまとめて返す
