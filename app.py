@@ -308,8 +308,9 @@ def oauth_callback(request: Request):
 
     state = request.query_params.get("state", "")
     st = pop_oauth_state(state)
-    user_id = (st or {}).get("user_id") or ""
-    if not user_id or not verify_state(state):
+    # ★ pop に失敗した場合は verify_state(state) から user_id を復元
+    user_id = (st or {}).get("user_id") or verify_state(state) or ""
+    if not user_id:
         return HTMLResponse("<h3>Invalid state</h3>", status_code=400)
 
     code = request.query_params.get("code")
@@ -1031,8 +1032,14 @@ def generate_plan(payload: dict = Body(...)):
         if not required_envs_ok():
             return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
         flow = build_flow()
+        state = signed_state(user_id)
+        # ★ ここが追加：/oauth/start と同じく state を保存
+        save_oauth_state(state, {"user_id": user_id})
         auth_url, _ = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+            state=state
         )
         return JSONResponse({
             "requires_auth": True,
@@ -1050,8 +1057,10 @@ def generate_plan(payload: dict = Body(...)):
         spreadsheet_id = create_sheet_and_write(plan_df, generate_sheet_title(user), user_id)
     except PermissionError:
         flow = build_flow()
+        state = signed_state(user_id)
+        save_oauth_state(state, {"user_id": user_id})
         auth_url, _ = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=state
         )
         return JSONResponse({
             "requires_auth": True,
