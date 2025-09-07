@@ -49,13 +49,78 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",  # ← 未使用なら外してもOK
 ]
 
+# ===== フィールド→列マッピング（列名はヘッダに合わせる） =====
+FIELD_TO_COL = {
+    "task name": "B",
+    "date": "C",
+    "day": "D",
+    "duration": "E",
+    "status": "F",
+}
+
+# ===== その他の定数 =====
 EXEMPT_PATHS = {"/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"}
 STATE_TTL = 10 * 60  # OAuth state の有効期間（秒）
+def _state_blob(state: str):
+    return _token_bucket().blob(f"oauth_state/{state}.json")
+
+def save_oauth_state(state: str, data: dict):
+    data = {**data, "exp": int(time.time()) + STATE_TTL}
+    _state_blob(state).upload_from_string(json.dumps(data), content_type="application/json")
+
+def pop_oauth_state(state: str) -> Optional[dict]:
+    b = _state_blob(state)
+    try:
+        data = json.loads(b.download_as_text())
+        if data.get("exp", 0) < int(time.time()):
+            return None
+        # ワンタイム
+        try: 
+            b.delete()
+        except Exception: 
+            pass
+        return data
+    except Exception:
+        return None
+
 DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # ===== FastAPI =====
 app = FastAPI()
 
+_GCS = None
+_SHEETS = {}        # {user_id: sheets_service}
+_CAL = {}           # {user_id: calendar_service}
+_ACCESS = {}        # {user_id: UserCredentials}
+
+def gcs() -> storage.Client:
+    global _GCS
+    if _GCS is None:
+        _GCS = storage.Client()
+    return _GCS
+
+def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
+    prev = _ACCESS.get(user_id)
+    if prev and prev.valid:
+        return prev
+
+    rt = load_refresh_token(user_id)
+    if not rt:
+        return None
+
+    creds = UserCredentials(
+        token=getattr(prev, "token", None) if prev else None,
+        refresh_token=rt,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=OAUTH_CLIENT_ID,
+        client_secret=OAUTH_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+    if not creds.valid:
+        creds.refresh(GoogleRequest())
+    _ACCESS[user_id] = creds
+    return creds
+    
 # ===== 追加: Pydantic models =====
 try:
     from pydantic import ConfigDict  # v2
@@ -106,6 +171,10 @@ def custom_openapi():
     }
     # 全体に適用（各パスに 'authorization' ヘッダが必須だと解釈される）
     schema["security"] = [{"ServiceBearer": []}]
+    # 認証不要エンドポイントは per-path で解除
+    for p in ["/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"]:
+        if "paths" in schema and p in schema["paths"]:
+            schema["paths"][p].setdefault("get", {}).setdefault("security", [])
     app.openapi_schema = schema
     return schema
 
@@ -141,8 +210,7 @@ def verify_api_key(request: Request, authorization: str = Header(None)):
 
 # ===== GCS Token Store =====
 def _token_bucket() -> storage.Bucket:
-    client = storage.Client()
-    return client.bucket(TOKEN_BUCKET)
+    return gcs().bucket(TOKEN_BUCKET)
 
 def _token_blob_path(user_id: str) -> str:
     safe = base64.urlsafe_b64encode(user_id.encode()).decode().rstrip("=")
@@ -151,19 +219,21 @@ def _token_blob_path(user_id: str) -> str:
 def save_refresh_token(user_id: str, refresh_token: str):
     blob = _token_bucket().blob(_token_blob_path(user_id))
     data = {"user_id": user_id, "refresh_token": refresh_token, "updated_at": int(time.time())}
-    blob.upload_from_string(json.dumps(data), content_type="application/json")
+    blob.upload_from_string(json.dumps(data, ensure_ascii=False), content_type="application/json")
 
 def load_refresh_token(user_id: str) -> Optional[str]:
     blob = _token_bucket().blob(_token_blob_path(user_id))
-    if not blob.exists():
+    try:
+        data = json.loads(blob.download_as_text())
+        return data.get("refresh_token")
+    except Exception:
         return None
-    data = json.loads(blob.download_as_text())
-    return data.get("refresh_token")
-
 
 # ===== OAuth Flow =====
 def oauth_redirect_uri() -> str:
     base = (BASE_URL or "").rstrip("/")
+    if not base:
+        raise RuntimeError("BASE_URL is not configured")
     return f"{base}/oauth/callback"
 
 def build_flow() -> Flow:
@@ -210,8 +280,11 @@ def oauth_start(user_id: Optional[str] = None):
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
     flow = build_flow()
+    # PKCE推奨：google-auth-oauthlib Flow は自動でPKCE対応（code_challenge）する
+    state = signed_state(user_id)
+    save_oauth_state(state, {"user_id": user_id})
     auth_url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent", state=signed_state(user_id)
+        access_type="offline", include_granted_scopes="true", prompt="consent", state=state
     )
     return RedirectResponse(auth_url, status_code=302)
 
@@ -221,8 +294,9 @@ def oauth_callback(request: Request):
         return HTMLResponse("<h3>OAuth env not set</h3>", status_code=500)
 
     state = request.query_params.get("state", "")
-    user_id = verify_state(state) or ""
-    if not user_id:
+    st = pop_oauth_state(state)
+    user_id = (st or {}).get("user_id") or ""
+    if not user_id or not verify_state(state):
         return HTMLResponse("<h3>Invalid state</h3>", status_code=400)
 
     code = request.query_params.get("code")
@@ -251,39 +325,31 @@ def auth_status(user_id: Optional[str] = None):
     return {"user_id": user_id, "authorized": bool(load_refresh_token(user_id))}
 
 def load_user_credentials(user_id: str) -> Optional[UserCredentials]:
-    rt = load_refresh_token(user_id)
-    if not rt:
-        return None
-    creds = UserCredentials(
-        token=None,
-        refresh_token=rt,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=OAUTH_CLIENT_ID,
-        client_secret=OAUTH_CLIENT_SECRET,
-        scopes=SCOPES,
-    )
-    try:
-        if not creds.valid:
-            creds.refresh(GoogleRequest())
-    except Exception:
-        return None
-    return creds
+    return _get_creds_cached(user_id)
 
 def get_user_sheets_service(user_id: str):
+    if user_id in _SHEETS:
+        return _SHEETS[user_id]
     creds = load_user_credentials(user_id)
     if not creds:
         return None
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    _SHEETS[user_id] = svc
+    return svc
 
 # ========= Calendar Service Helper =========
 def get_user_calendar_service(user_id: str):
+    if user_id in _CAL:
+        return _CAL[user_id]
     creds = load_user_credentials(user_id)
     if not creds:
         return None
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    _CAL[user_id] = svc
+    return svc
 
 # ========= 日付/時刻ユーティリティ =========
-def _parse_date_yyyy_mm_dd(s: str) -> Optional[datetime.date]:
+def parse_ymd(s: str) -> Optional[datetime.date]:
     try:
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
@@ -316,34 +382,73 @@ def make_event_id(user_id: str, wbs: str, date_str: str) -> str:
     h = hashlib.sha1(raw).hexdigest()
     return f"gpts-{h}"
 
-# === Chapter items helpers (add) ===
-def expand_chapter_items_named(counts: List[int], titles: Optional[List[str]] = None) -> List[str]:
-    """
-    counts: 各章の項目数 [12, 10, 8, ...]
-    titles: 章タイトル（任意） ["第1章 戦略", "第2章 マネジメント", ...]
-    返り値: ["Chapter 1 - Item 1", ...] または ["第1章 戦略 - Item 1", ...]
-    """
+def _row_to_event_body(row: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+    date_str = (row.get("Date") or "").strip()
+    task_name = (row.get("Task Name") or row.get("task") or "学習タスク").strip()
+    status = (row.get("Status") or "").strip()
+    note = (row.get("Note") or "").strip()
+    start_hhmm = (row.get("Start") or row.get("start") or "").strip()
+    end_hhmm = (row.get("End") or row.get("end") or "").strip()
+
+    # Duration は数値/文字列どちらでも来るので str() を噛ませる
+    try:
+        duration_min = int(str(row.get("Duration", "0")).strip())
+    except Exception:
+        duration_min = None
+
+    d = parse_ymd(date_str)
+    if not d:
+        raise ValueError("Invalid Date in row: expected YYYY-MM-DD")
+
+    start_iso = rfc3339(d, start_hhmm)
+
+    if start_iso:
+        if end_hhmm:
+            end_iso = rfc3339(d, end_hhmm)
+        else:
+            mins = duration_min if duration_min and duration_min > 0 else 60
+            end_dt = datetime.strptime(f"{date_str} {start_hhmm}", "%Y-%m-%d %H:%M") + timedelta(minutes=mins)
+            end_iso = f"{end_dt.strftime('%Y-%m-%dT%H:%M')}:00{TZ_OFFSET}"
+        body = {
+            "summary": task_name,
+            "description": f"Status: {status}\nNote: {note}",
+            "start": {"dateTime": start_iso, "timeZone": USER_TZ},
+            "end": {"dateTime": end_iso, "timeZone": USER_TZ},
+        }
+    else:
+        body = {
+            "summary": f"{task_name}（終日）",
+            "description": f"Status: {status}\nNote: {note}",
+            "start": {"date": date_str},
+            "end": {"date": (d + timedelta(days=1)).isoformat()},
+        }
+
+    return date_str, body
+
+
+    
+#=== Chapter items helpers (add) ===
+def _gcs_get_json_or_default(bucket_name: str, blob_path: str, default):
+    try:
+        b = gcs().bucket(bucket_name).blob(blob_path)
+        return json.loads(b.download_as_text())
+    except Exception:
+        return default
+
+def expand_chapter_items(counts: List[int], titles: Optional[List[str]] = None) -> List[str]:
     items = []
     for i, c in enumerate(counts):
-        base = titles[i].strip() if (titles and i < len(titles) and titles[i]) else f"Chapter {i+1}"
+        base = titles[i].strip() if titles and i < len(titles) and titles[i] else f"Chapter {i+1}"
         for j in range(1, int(c) + 1):
             items.append(f"{base} - Item {j}")
     return items
 
 def _load_chapter_items_from_gcs_or_none(book_filename: str) -> Optional[List[str]]:
-    """
-    GCS に {BOOK_DATA_BUCKET}/{book_filename} があれば JSON を返し、無ければ None。
-    JSON は ["Chapter 1 - Item 1", ...] のリスト想定。
-    """
-    client = storage.Client()
-    bucket = client.bucket(BOOK_DATA_BUCKET)
-    blob = bucket.blob(book_filename)
-    if not blob.exists():
-        return None
+    blob = gcs().bucket(BOOK_DATA_BUCKET).blob(book_filename)
     try:
-        return json.loads(blob.download_as_text())
-    except Exception as e:
-        raise ValueError(f"invalid chapter data: {e}")
+        return json.loads(blob.download_as_text())  # NotFoundはexceptに落ちる
+    except Exception:
+        return None
 
 def _normalize_chapter_items(data: dict, book_keyword: str) -> List[str]:
     """
@@ -363,14 +468,14 @@ def _normalize_chapter_items(data: dict, book_keyword: str) -> List[str]:
         xs = data["chapter_items_list"]
         # ints の配列なら展開、strings の配列ならそのまま採用
         if all(isinstance(x, int) for x in xs):
-            return expand_chapter_items(xs)
+            return expand_chapter_items(xs, None)
         if all(isinstance(x, str) for x in xs):
             return xs
         raise ValueError("chapter_items_list must be an array of integers or strings")
 
     if "chapter_counts" in data and data["chapter_counts"]:
         counts = [int(x) for x in data["chapter_counts"]]
-        return expand_chapter_items_named(counts)
+        return expand_chapter_items(counts, None)
 
     if "chapters" in data and data["chapters"]:
         # ex: [{"title":"第1章 戦略","count":10}, {"title":"第2章 ...","count":12}]
@@ -380,12 +485,13 @@ def _normalize_chapter_items(data: dict, book_keyword: str) -> List[str]:
         for obj in ch:
             counts.append(int(obj.get("count", 0)))
             titles.append(str(obj.get("title") or "").strip() or None)
-        return expand_chapter_items_named(counts, titles)
-
+        return expand_chapter_items(counts, titles)
+        
     # 2) GCS フォールバック
-    gcs = _load_chapter_items_from_gcs_or_none(f"{book_keyword}.json")
-    if gcs:
-        return gcs
+    fallback = _load_chapter_items_from_gcs_or_none(f"{book_keyword}.json")
+    if fallback:
+        return fallback
+
 
     # 3) エラー
     raise ValueError(
@@ -435,17 +541,13 @@ def is_rest_day(d: datetime, rest_days: List[str]) -> bool:
 def next_day(d: datetime) -> datetime:
     return d + timedelta(days=1)
 
-def expand_chapter_items(counts: List[int]) -> List[str]:
-    items = []
-    for idx, c in enumerate(counts):
-        for j in range(1, c + 1):
-            items.append(f"Chapter {idx+1} - Item {j}")
-    return items
-
 def calculate_available_time(user: UserSetting, date: datetime) -> int:
-    if is_rest_day(date, user.rest_days):
+    d = date.date() if isinstance(date, datetime) else date
+    # 休みロジック
+    if DAY_ABBR[d.weekday()] in set(user.rest_days):
         return 0
-    return user.weekend_minutes if is_weekend(date) else user.weekday_minutes
+    # 平日/週末で切替
+    return user.weekend_minutes if d.weekday() >= 5 else user.weekday_minutes
 
 class StudyPlanner:
     def __init__(self, user: UserSetting, chapter_items_list: List[str]):
@@ -657,13 +759,14 @@ class StudyPlanner:
         self.step2_second_round()
         self.step5_weekend_reviews()
 
-    def run_phase2(self):
+    def run_phase2(self) -> List[Dict[str, object]]:
         if not self.is_short:
             self.step6_refresh_days()
         self.step7_past_exam_plan()
         raw_units = self.snapshot_raw_units()
         self.step8_summarize_tasks()
         self.step9_merge_plan()
+        return raw_units
 
 
 def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSetting, List[Dict[str, object]]]:
@@ -687,15 +790,7 @@ def generate_study_plan(data: dict, user_id: str) -> Tuple[pd.DataFrame, UserSet
     
     # --- phase 1
     planner.run_phase1()
-    # --- phase 2 を手動展開（step8直前でスナップショットを取るため）
-    if not planner.is_short:
-        planner.step6_refresh_days()
-    planner.step7_past_exam_plan()
-    
-    raw_units = planner.snapshot_raw_units()
-    # 以降は従来どおりまとめる
-    planner.step8_summarize_tasks()
-    planner.step9_merge_plan()
+    raw_units = planner.run_phase2()
 
     return planner.plan_df, user, raw_units
 
@@ -709,16 +804,14 @@ def save_raw_plan_units_to_gcs(user_id: str, spreadsheet_id: str, raw_units: Lis
     "最小タスク単位"（統合前の1アイテム=10分/7分/5分や過去問など、step8でまとめる前の全行）を
     BACKUP_BUCKET に JSON として保存。
     """
-    client = storage.Client()
-    bucket = client.bucket(BACKUP_BUCKET)
+    bucket = gcs().bucket(BACKUP_BUCKET)
     path = _raw_units_path(user_id, spreadsheet_id)
     blob = bucket.blob(path)
     blob.upload_from_string(json.dumps(raw_units, ensure_ascii=False), content_type="application/json")
     return f"gs://{BACKUP_BUCKET}/{path}"
 
 def load_raw_plan_units_from_gcs(user_id: str, spreadsheet_id: str) -> Optional[List[Dict[str, object]]]:
-    client = storage.Client()
-    bucket = client.bucket(BACKUP_BUCKET)
+    bucket = gcs().bucket(BACKUP_BUCKET)
     path = _raw_units_path(user_id, spreadsheet_id)
     blob = bucket.blob(path)
     if not blob.exists():
@@ -737,8 +830,7 @@ def append_url_backup(user_id: str, spreadsheet_id: str, spreadsheet_url: str, n
     シートURLの履歴を JSONL で1行追記する。
     例: gs://{BACKUP_BUCKET}/gpts-plans/{user_id}/history/url_backups.jsonl
     """
-    client = storage.Client()
-    bucket = client.bucket(BACKUP_BUCKET)
+    bucket = gcs().bucket(BACKUP_BUCKET)
     obj = _url_backup_object_name(user_id)
     blob = bucket.blob(obj)
 
@@ -873,6 +965,19 @@ def create_sheet_and_write(plan_df: pd.DataFrame, sheet_title: str, user_id: str
                             "condition": {
                                 "type": "CUSTOM_FORMULA",
                                 "values": [{"userEnteredValue": '=AND($F2<>"", $F2<>"完了")'}]
+                 
+                            
+                            
+                            
+                            
+                            
+                            
+                            
+                            
+                            
+                            
+                            
+                            
                             },
                             "format": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.85}}
                         }
@@ -892,19 +997,12 @@ def generate_sheet_title(user: UserSetting) -> str:
     return f"user_{user.user_id}_plan_{user.start_date.strftime('%Y%m%d')}"
 
 def load_user_sheet_map() -> Dict[str, Dict[str, str]]:
-    client = storage.Client()
-    bucket = client.bucket(USER_SHEET_MAP_BUCKET)
-    blob = bucket.blob(USER_SHEET_MAP_BLOB)
-    if not blob.exists():
-        return {}
-    return json.loads(blob.download_as_text())
+    return _gcs_get_json_or_default(USER_SHEET_MAP_BUCKET, USER_SHEET_MAP_BLOB, {})
 
 def save_user_sheet_map(mapping: Dict[str, Dict[str, str]]) -> None:
-    client = storage.Client()
-    bucket = client.bucket(USER_SHEET_MAP_BUCKET)
+    bucket = gcs().bucket(USER_SHEET_MAP_BUCKET)
     blob = bucket.blob(USER_SHEET_MAP_BLOB)
     blob.upload_from_string(json.dumps(mapping, ensure_ascii=False), content_type="application/json")
-
 
 # ===== Endpoints =====
 @app.post("/generate", dependencies=[Depends(verify_api_key)])
@@ -969,15 +1067,11 @@ def generate_plan(payload: dict = Body(...)):
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "raw_backup_uri": raw_uri, 
-        "plan": plan_df.to_dict(orient="records")
     }
 
 
 def get_user_spreadsheet_id(user_id: str) -> Optional[str]:
-    mapping = load_user_sheet_map()
-    if not mapping or user_id not in mapping:
-        return None
-    return mapping[user_id].get("spreadsheet_id")
+    return (load_user_sheet_map().get(user_id) or {}).get("spreadsheet_id")
 
 @app.post("/get_tasks", dependencies=[Depends(verify_api_key)])
 def get_tasks(payload: dict = Body(...)):
@@ -1056,15 +1150,6 @@ def update_task(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error": f"Failed to fetch sheet metadata: {e}"}, status_code=500)
 
-    # フィールド→列マッピング（列名はヘッダに合わせる）
-    FIELD_TO_COL = {
-        "task name": "B",
-        "date": "C",
-        "day": "D",
-        "duration": "E",
-        "status": "F",
-    }
-
     # 入力キーの正規化と検証
     normalized_updates = {}
     for k, v in updates.items():
@@ -1123,13 +1208,7 @@ def insert_task(payload: dict = Body(...)):
     並びルール（asc）: C列(Date) 昇順。同一日付は末尾。
     """
     from datetime import datetime
-
-    def _parse_date(s: str):
-        try:
-            return datetime.strptime(s, "%Y-%m-%d").date()
-        except Exception:
-            return None
-
+    
     user_id = (payload.get("user_id") or "").strip()
     task_in = (payload.get("task") or {})
     order = (payload.get("order") or "asc").lower()
@@ -1142,13 +1221,14 @@ def insert_task(payload: dict = Body(...)):
     day_str  = (task_in.get("day")  or "").strip()          # D: Day
     duration_raw = task_in.get("duration", "")              # E: Duration
     status   = (task_in.get("status") or "未着手").strip()  # F: Status
-    ins_date = _parse_date(date_str)
+  
+    ins_date = parse_ymd(date_str)
     if not ins_date:
         return JSONResponse({"error": "task.date must be 'YYYY-MM-DD'"}, status_code=400)
     if not day_str:
         day_str = DAY_ABBR[ins_date.weekday()]
     try:
-        duration_val = int(duration_raw)
+        duration_val = int(str(duration_raw))
     except Exception:
         duration_val = 60  # デフォルト
 
@@ -1181,7 +1261,7 @@ def insert_task(payload: dict = Body(...)):
     insert_row_1based = 2 + len(rows)
     if order == "asc":
         for i, r in enumerate(rows):
-            r_date = _parse_date((r[0] if r else "").strip())
+            r_date = parse_ymd((r[0] if r else "").strip())
             if r_date and ins_date < r_date:
                 insert_row_1based = 2 + i
                 break
@@ -1406,7 +1486,7 @@ def preview_week(payload: dict = Body(...)):
     rows = values[1:]
 
     if week_of:
-        base = _parse_date_yyyy_mm_dd(week_of) or datetime.utcnow().date()
+        base = parse_ymd(week_of) or datetime.utcnow().date()
         monday = start_of_week(base)
     else:
         monday = next_monday()
@@ -1415,7 +1495,7 @@ def preview_week(payload: dict = Body(...)):
     out = []
     for r in rows:
         row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        d = _parse_date_yyyy_mm_dd((row.get("Date") or "").strip())
+        d = parse_ymd((row.get("Date") or "").strip())
         if d and monday <= d <= sunday:
             out.append(row)
 
@@ -1470,74 +1550,39 @@ def calendar_register_week(payload: dict = Body(...)):
     created, updated, skipped = [], [], []
     for row in tasks:
         wbs = (row.get("WBS") or "").strip()
-        date_str = (row.get("Date") or "").strip()
-        task_name = (row.get("Task Name") or "").strip() or (row.get("task") or "").strip()
-        status = (row.get("Status") or "").strip()
-        note = (row.get("Note") or "").strip()
-        start_hhmm = (row.get("Start") or row.get("start") or "").strip()
-        end_hhmm = (row.get("End") or row.get("end") or "").strip()
 
-        duration_min = None
-        try:
-            duration_min = int((row.get("Duration") or "0").strip())
-        except Exception:
-            pass
+        # ★ここから差し替え
+        date_str, body = _row_to_event_body(row)
 
-        start_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), start_hhmm)
-        if start_iso:
-            if end_hhmm:
-                end_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), end_hhmm)
-            else:
-                mins = duration_min if duration_min and duration_min > 0 else 60
-                end_dt = datetime.strptime(f"{date_str} {start_hhmm}", "%Y-%m-%d %H:%M") + timedelta(minutes=mins)
-                end_iso = f"{end_dt.strftime('%Y-%m-%dT%H:%M')}:00{TZ_OFFSET}"
-            body = {
-                "summary": task_name or "学習タスク",
-                "description": f"Status: {status}\nNote: {note}",
-                "start": {"dateTime": start_iso, "timeZone": USER_TZ},
-                "end": {"dateTime": end_iso, "timeZone": USER_TZ},
-                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
-            }
-        else:
-            body = {
-                "summary": task_name or "学習タスク（終日）",
-                "description": f"Status: {status}\nNote: {note}",
-                "start": {"date": date_str},
-                "end": {"date": (_parse_date_yyyy_mm_dd(date_str) + timedelta(days=1)).isoformat()},
-                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
-            }
+        # 固有の拡張プロパティだけ後付け
+        body.setdefault("extendedProperties", {}).setdefault("private", {})
+        body["extendedProperties"]["private"].update({"gpts_wbs": wbs, "gpts_date": date_str})
 
         ev_id = make_event_id(user_id, wbs or "no-wbs", date_str or "no-date")
         if dry_run:
-            skipped.append({"id": ev_id, "title": body["summary"], "date": date_str})
+            skipped.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
             continue
 
         try:
-            cal.events().insert(
+            cal.events().update(
                 calendarId=calendar_id,
-                body=body,
                 eventId=ev_id,
-                sendUpdates="none",
-                conferenceDataVersion=0,
-                supportsAttachments=False,
-                maxAttendees=1,
-                sendNotifications=False,
-                quotaUser=user_id
+                body=body,
+                sendUpdates="none"
             ).execute()
-            created.append({"id": ev_id, "title": body["summary"], "date": date_str})
-        except Exception as e:
-            msg = str(e)
-            if "already exists" in msg or "Duplicate" in msg or "409" in msg:
-                try:
-                    cal.events().update(
-                        calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
-                    ).execute()
-                    updated.append({"id": ev_id, "title": body["summary"], "date": date_str})
-                except Exception as e2:
-                    skipped.append({"id": ev_id, "error": f"update failed: {e2}"})
-            else:
-                skipped.append({"id": ev_id, "error": msg})
-
+            updated.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
+        except Exception as e_upd:
+            # 新規作成（importは body['id'] を尊重）
+            try:
+                body_with_id = dict(body)
+                body_with_id["id"] = ev_id
+                cal.events().import(
+                    calendarId=calendar_id,
+                    body=body_with_id
+                ).execute()
+                created.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
+            except Exception as e_imp:
+                skipped.append({"id": ev_id, "error": f"import failed: {e_imp}"})
     return {
         "week": week,
         "calendar_id": calendar_id,
@@ -1614,53 +1659,23 @@ def calendar_register_by_wbs(payload: dict = Body(...)):
     created, updated, skipped = [], [], []
     for row in target:
         wbs = (row.get("WBS") or "").strip()
-        date_str = (row.get("Date") or "").strip()
-        task_name = (row.get("Task Name") or "").strip() or (row.get("task") or "").strip()
-        status = (row.get("Status") or "").strip()
-        note = (row.get("Note") or "").strip()
-        start_hhmm = (row.get("Start") or row.get("start") or "").strip()
-        end_hhmm = (row.get("End") or row.get("end") or "").strip()
 
-        duration_min = None
-        try:
-            duration_min = int((row.get("Duration") or "0").strip())
-        except Exception:
-            pass
+        # ★ここから差し替え
+        date_str, body = _row_to_event_body(row)
 
-        start_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), start_hhmm)
-        if start_iso:
-            if end_hhmm:
-                end_iso = rfc3339(_parse_date_yyyy_mm_dd(date_str), end_hhmm)
-            else:
-                mins = duration_min if duration_min and duration_min > 0 else 60
-                end_dt = datetime.strptime(f"{date_str} {start_hhmm}", "%Y-%m-%d %H:%M") + timedelta(minutes=mins)
-                end_iso = f"{end_dt.strftime('%Y-%m-%dT%H:%M')}:00{TZ_OFFSET}"
-            body = {
-                "summary": task_name or "学習タスク",
-                "description": f"Status: {status}\nNote: {note}",
-                "start": {"dateTime": start_iso, "timeZone": USER_TZ},
-                "end": {"dateTime": end_iso, "timeZone": USER_TZ},
-                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
-            }
-        else:
-            body = {
-                "summary": task_name or "学習タスク（終日）",
-                "description": f"Status: {status}\nNote: {note}",
-                "start": {"date": date_str},
-                "end": {"date": (_parse_date_yyyy_mm_dd(date_str) + timedelta(days=1)).isoformat()},
-                "extendedProperties": {"private": {"gpts_wbs": wbs, "gpts_date": date_str}},
-            }
+        body.setdefault("extendedProperties", {}).setdefault("private", {})
+        body["extendedProperties"]["private"].update({"gpts_wbs": wbs, "gpts_date": date_str})
 
         ev_id = make_event_id(user_id, wbs or "no-wbs", date_str or "no-date")
         if dry_run:
-            skipped.append({"id": ev_id, "title": body["summary"], "date": date_str})
+            skipped.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
             continue
 
         try:
             cal.events().insert(
                 calendarId=calendar_id, body=body, eventId=ev_id, sendUpdates="none"
             ).execute()
-            created.append({"id": ev_id, "title": body["summary"], "date": date_str})
+            created.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
         except Exception as e:
             msg = str(e)
             if "already exists" in msg or "Duplicate" in msg or "409" in msg:
@@ -1668,12 +1683,12 @@ def calendar_register_by_wbs(payload: dict = Body(...)):
                     cal.events().update(
                         calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
                     ).execute()
-                    updated.append({"id": ev_id, "title": body["summary"], "date": date_str})
+                    updated.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
                 except Exception as e2:
                     skipped.append({"id": ev_id, "error": f"update failed: {e2}"})
             else:
                 skipped.append({"id": ev_id, "error": msg})
-
+                
     return {
         "calendar_id": calendar_id,
         "created": created,
@@ -1713,15 +1728,13 @@ def list_url_backups(user_id: str):
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
 
-    client = storage.Client()
-    bucket = client.bucket(BACKUP_BUCKET)
     obj = _url_backup_object_name(user_id)
-    blob = bucket.blob(obj)
-    if not blob.exists():
-        return {"items": []}
-
     try:
-        lines = blob.download_as_text().splitlines()
+        text = gcs().bucket(BACKUP_BUCKET).blob(obj).download_as_text()
+    except Exception:
+        return {"items": []}
+    try:
+        lines = text.splitlines()
         items = [json.loads(x) for x in lines if x.strip()]
         items.sort(key=lambda r: r.get("ts", ""), reverse=True)
         return {"items": items}
@@ -2082,33 +2095,34 @@ def day_off(payload: dict = Body(...)):
     }
 
 def _ac_load_from_gcs(force: bool = False):
-    """GCS から略語辞書を読み込み、メモリキャッシュする。"""
     now = time.time()
     if not force and (now - _AC_CACHE["last"] < ACRONYM_REFRESH_SEC) and _AC_CACHE["terms"]:
         return
-    cli = storage.Client()
-    blob = cli.bucket(ACRONYM_BUCKET).blob(ACRONYM_PATH)
 
-    # 変更検知（ETag）
-    blob.reload()
+    blob = gcs().bucket(ACRONYM_BUCKET).blob(ACRONYM_PATH)
+    # 変更検知（ETag）: blob.reload() の失敗を握りつぶして空キャッシュ
+    try:
+        blob.reload()
+    except Exception:
+        _AC_CACHE.update({"terms": {}, "last": now, "etag": None})
+        return
+
     etag = getattr(blob, "etag", None)
     if not force and _AC_CACHE["etag"] and etag == _AC_CACHE["etag"]:
         _AC_CACHE["last"] = now
         return
 
     data = blob.download_as_text()
-    obj = json.loads(data)  # 形式: { "DNS": { ...AcronymCard... }, "SMTP": {...}, ... }
+    obj = json.loads(data)  # { "DNS": {...}, ... }
 
     terms = {}
     for k, card in obj.items():
         key = (k or "").upper()
-        if not key:
-            continue
-        terms[key] = card
+        if key:
+            terms[key] = card
 
-    _AC_CACHE["terms"] = terms
-    _AC_CACHE["last"] = now
-    _AC_CACHE["etag"] = etag
+    _AC_CACHE.update({"terms": terms, "last": now, "etag": etag})
+
 
 def _ac_get(term: str):
     _ac_load_from_gcs()
@@ -2159,8 +2173,7 @@ def register_book_chapters(payload: dict = Body(...)):
         return JSONResponse({"error": f"chapter items error: {e}"}, status_code=400)
 
     overwrite = bool(payload.get("overwrite", False))
-    client = storage.Client()
-    bucket = client.bucket(BOOK_DATA_BUCKET)
+    bucket = gcs().bucket(BOOK_DATA_BUCKET)
     blob = bucket.blob(f"{book_keyword}.json")
 
     if blob.exists() and not overwrite:
