@@ -21,6 +21,7 @@ from google.cloud import storage
 import random
 from pydantic import BaseModel, AnyUrl
 from fastapi.openapi.utils import get_openapi
+from google.auth.exceptions import RefreshError
 
 # ===== Configuration (env) =====
 USER_TZ = os.getenv("USER_TZ", "Asia/Tokyo")         # 予約（将来のタイムゾーン対応）
@@ -99,6 +100,12 @@ def gcs() -> storage.Client:
         _GCS = storage.Client()
     return _GCS
 
+def _delete_refresh_token(user_id: str):
+    try:
+        gcs().bucket(TOKEN_BUCKET).blob(_token_blob_path(user_id)).delete()
+    except Exception:
+        pass
+
 def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
     prev = _ACCESS.get(user_id)
     if prev and prev.valid:
@@ -116,8 +123,14 @@ def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
         client_secret=OAUTH_CLIENT_SECRET,
         scopes=SCOPES,
     )
-    if not creds.valid:
-        creds.refresh(GoogleRequest())
+    try:
+        if not creds.valid:
+            creds.refresh(GoogleRequest())
+    except RefreshError:
+        # ← ここが今回のエラー。保存済みRTを破棄し再認可に誘導
+        _delete_refresh_token(user_id)
+        _ACCESS.pop(user_id, None)
+        return None
     _ACCESS[user_id] = creds
     return creds
     
@@ -322,7 +335,9 @@ def oauth_callback(request: Request):
 def auth_status(user_id: Optional[str] = None):
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
-    return {"user_id": user_id, "authorized": bool(load_refresh_token(user_id))}
+    # 実際に取得/refresh まで試みて可否を返す
+    ok = bool(_get_creds_cached(user_id))
+    return {"user_id": user_id, "authorized": ok}
 
 def load_user_credentials(user_id: str) -> Optional[UserCredentials]:
     return _get_creds_cached(user_id)
@@ -1671,23 +1686,19 @@ def calendar_register_by_wbs(payload: dict = Body(...)):
             skipped.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
             continue
 
+    # 置き換え：insert をやめて update→import の順に
         try:
-            cal.events().insert(
-                calendarId=calendar_id, body=body, eventId=ev_id, sendUpdates="none"
+            cal.events().update(
+                calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
             ).execute()
-            created.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
-        except Exception as e:
-            msg = str(e)
-            if "already exists" in msg or "Duplicate" in msg or "409" in msg:
-                try:
-                    cal.events().update(
-                        calendarId=calendar_id, eventId=ev_id, body=body, sendUpdates="none"
-                    ).execute()
-                    updated.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
-                except Exception as e2:
-                    skipped.append({"id": ev_id, "error": f"update failed: {e2}"})
-            else:
-                skipped.append({"id": ev_id, "error": msg})
+            updated.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
+        except Exception as e_upd:
+            try:
+                body_with_id = dict(body); body_with_id["id"] = ev_id
+                getattr(cal.events(), "import")(calendarId=calendar_id, body=body_with_id).execute()
+                created.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
+            except Exception as e_imp:
+                skipped.append({"id": ev_id, "error": f"import failed: {e_imp}"})
                 
     return {
         "calendar_id": calendar_id,
