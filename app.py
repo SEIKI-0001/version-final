@@ -838,6 +838,9 @@ def load_raw_plan_units_from_gcs(user_id: str, spreadsheet_id: str) -> Optional[
         return None
 
 # === URL-backup helpers ===
+def spreadsheet_web_url(spreadsheet_id: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid=0"
+
 def _url_backup_object_name(user_id: str) -> str:
     return f"gpts-plans/{user_id}/history/url_backups.jsonl"
 
@@ -1099,15 +1102,14 @@ def get_user_spreadsheet_id(user_id: str) -> Optional[str]:
 
 @app.post("/get_tasks", dependencies=[Depends(verify_api_key)])
 def get_tasks(payload: dict = Body(...)):
+    """
+    認証確認 → 現行シートID解決 → {spreadsheet_id, spreadsheet_url} だけ返す
+    """
     user_id = (payload.get("user_id") or "").strip()
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
 
-    spreadsheet_id = get_user_spreadsheet_id(user_id)
-    if not spreadsheet_id:
-        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
-
-    # get_tasks 内、svc is None の分岐を置き換え
+    # 先に OAuth を確認（未認可なら authorize_url を返す）
     svc = get_user_sheets_service(user_id)
     if svc is None:
         if not required_envs_ok():
@@ -1123,6 +1125,46 @@ def get_tasks(payload: dict = Body(...)):
             "authorize_url": auth_url,
             "message": "Authorization required. Please authorize via the URL, then retry."
         }, status_code=200)
+
+    # 現行シートIDを mapping から取得
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    # ここでは中身は返さず、リンクだけ返す
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_web_url(spreadsheet_id),
+    }
+    
+@app.post("/get_tasks_full", dependencies=[Depends(verify_api_key)])
+def get_tasks_full(payload: dict = Body(...)):
+    """
+    旧 /get_tasks の振る舞い：計画の中身（A1:F10000）を返す
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    if not user_id:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
+        if not required_envs_ok():
+            return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
+        flow = build_flow()
+        state = signed_state(user_id)
+        save_oauth_state(state, {"user_id": user_id})
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=state
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Authorization required. Please authorize via the URL, then retry."
+        }, status_code=200)
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
     try:
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -1145,6 +1187,7 @@ def get_tasks(payload: dict = Body(...)):
         if any((c or "").strip() for c in row)
     ]
     return {"tasks": tasks}
+
 
 # === New: Update task fields by WBS (single sheet) ===
 @app.post("/update_task", dependencies=[Depends(verify_api_key)])
