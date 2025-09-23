@@ -126,14 +126,14 @@ def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
     try:
         if not creds.valid:
             creds.refresh(GoogleRequest())
-    except RefreshError:
-        # ← ここが今回のエラー。保存済みRTを破棄し再認可に誘導
-        _delete_refresh_token(user_id)
+    except RefreshError as e:
+        # 本当に失効/クライアント不整合の時だけ削除
+        msg = (e.args[0] if e.args else "")
+        if "invalid_grant" in str(msg) or "invalid_client" in str(msg):
+            _delete_refresh_token(user_id)
         _ACCESS.pop(user_id, None)
         return None
-    _ACCESS[user_id] = creds
-    return creds
-    
+   
 # ===== 追加: Pydantic models =====
 try:
     from pydantic import ConfigDict  # v2
@@ -440,8 +440,6 @@ def _row_to_event_body(row: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
         }
 
     return date_str, body
-
-
     
 #=== Chapter items helpers (add) ===
 def _gcs_get_json_or_default(bucket_name: str, blob_path: str, default):
@@ -467,18 +465,7 @@ def _load_chapter_items_from_gcs_or_none(book_filename: str) -> Optional[List[st
         return None
 
 def _normalize_chapter_items(data: dict, book_keyword: str) -> List[str]:
-    """
-    優先順:
-      1) payload で明示された章情報（複数形式対応）
-      2) GCS の book_keyword.json
-      3) どちらも無ければ 400
-    サポートする payload 形式:
-      - chapter_items_list: 既存仕様
-          a) [int,int,...] -> expand
-          b) [str,str,...] -> そのまま項目名として採用
-      - chapter_counts: [int,int,...] 章ごとの項目数
-      - chapters: [{title: "...", count: 12}, ...] 章タイトル＋項目数
-    """
+
     # 1) payload 最優先
     if "chapter_items_list" in data and data["chapter_items_list"]:
         xs = data["chapter_items_list"]
