@@ -1415,120 +1415,208 @@ def insert_task(payload: dict = Body(...)):
         "wbs": inserted_wbs
     }
 
-# === New: Delete task by WBS and renumber ===
-@app.post("/delete_task", dependencies=[Depends(verify_api_key)])
-def delete_task(payload: dict = Body(...)):
+# === New: Delete by WBS (single or multiple) and keep raw_units consistent ===
+@app.post("/delete", dependencies=[Depends(verify_api_key)])
+def delete_tasks(payload: dict = Body(...)):
     """
-    指定 WBS 行を物理削除し、その後 A列のWBSを先頭値に合わせて連番で振り直す。
-    （短期: wbs1始まり / 長期: wbs0始まり に自動追従）
-    単一シート前提：常に一枚目のシートを対象。
+    body:
+      {
+        "user_id": "...",
+        "wbs_id": "wbs12",           # 単数でもOK
+        "wbs_ids": ["wbs12","wbs13"],# 複数指定でもOK（wbs_id / wbs_ids どちらでも）
+        "dry_run": false
+      }
+    挙動:
+      - シートから対象行を一括削除（下から）
+      - A列WBSを振り直し
+      - raw_units(バックアップ) からも該当ユニットを除去して保存（将来の再配分の一貫性を維持）
     """
     user_id = (payload.get("user_id") or "").strip()
-    wbs_id = (payload.get("wbs_id") or "").strip()
-    if not user_id or not wbs_id:
-        return JSONResponse({"error": "user_id and wbs_id are required"}, status_code=400)
+    dry_run = bool(payload.get("dry_run", False))
+    w1 = (payload.get("wbs_id") or "").strip()
+    wN = payload.get("wbs_ids") or []
+    wbs_ids = [w1] if (w1 and not wN) else (wN if wN else ([w1] if w1 else []))
 
-    # Spreadsheet / service
+    if not user_id or not wbs_ids:
+        return JSONResponse({"error": "user_id and at least one of wbs_id/wbs_ids are required"}, status_code=400)
+    wset = set(str(w).strip() for w in wbs_ids if str(w).strip())
+    if not wset:
+        return JSONResponse({"error": "no valid WBS IDs"}, status_code=400)
+
     spreadsheet_id = get_user_spreadsheet_id(user_id)
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
-    service = get_user_sheets_service(user_id)
-    if service is None:
+    svc = get_user_sheets_service(user_id)
+    if svc is None:
         return JSONResponse({"error": "Authorization required"}, status_code=401)
 
-    # シート情報
+    # シート情報と全行
     try:
-        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheet = meta["sheets"][0]  # 単一シート前提
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet = meta["sheets"][0]
         sheet_id = sheet["properties"]["sheetId"]
         sheet_title = sheet["properties"]["title"]
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to fetch sheet metadata: {e}"}, status_code=500)
-
-    # A列（WBS）を取得し、対象行を特定
-    rng = f"{sheet_title}!A2:A10000"
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=rng
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F10000"
         ).execute()
     except Exception as e:
-        return JSONResponse({"error": f"Failed to read values: {e}"}, status_code=500)
+        return JSONResponse({"error": f"Failed to read sheet: {e}"}, status_code=500)
 
-    values = result.get("values", [])  # [["wbs0"], ["wbs1"], ...]
-    target_row_index_1based = None
-    for i, row in enumerate(values):
-        a = (row[0] if row else "").strip()
-        if a == wbs_id:
-            target_row_index_1based = i + 2  # A2 は行=2
-            break
-    if not target_row_index_1based:
-        return JSONResponse({"error": "WBS ID not found"}, status_code=404)
+    values = res.get("values", [])
+    if not values or len(values) < 2:
+        return {"deleted": 0, "candidates": []}
 
-    # 物理削除（0始まり、endは非包含）
-    start_index_0based = target_row_index_1based - 1
-    end_index_0based = target_row_index_1based
-    try:
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={
-                "requests": [{
-                    "deleteDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": start_index_0based,
-                            "endIndex": end_index_0based
-                        }
-                    }
-                }]
+    headers = values[0]
+    rows = values[1:]
+
+    # 対象行を特定（1-based 行番号）
+    targets = []
+    for i, r in enumerate(rows, start=2):
+        w = (r[0] if r else "").strip()
+        if w in wset:
+            name = (r[headers.index("Task Name")] if "Task Name" in headers and len(r)>headers.index("Task Name") else "")
+            date = (r[headers.index("Date")] if "Date" in headers and len(r)>headers.index("Date") else "")
+            targets.append({"row": i, "WBS": w, "Task Name": name, "Date": date})
+
+    if dry_run:
+        return {"dry_run": True, "requested": list(wset), "found": len(targets), "candidates": targets}
+
+    if not targets:
+        return {"deleted": 0, "renumbered": False, "requested": list(wset)}
+
+    # 下から deleteDimension
+    requests = []
+    for t in sorted(targets, key=lambda x: x["row"], reverse=True):
+        start0 = t["row"] - 1
+        requests.append({
+            "deleteDimension": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": start0, "endIndex": start0 + 1}
             }
-        ).execute()
+        })
+    try:
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
     except Exception as e:
         return JSONResponse({"error": f"Delete failed: {e}"}, status_code=500)
 
-    # 再読込して WBS を振り直し
+    # WBS 振り直し
     try:
-        result2 = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=rng
+        resA = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A2:A10000"
         ).execute()
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to re-read values: {e}"}, status_code=500)
-
-    a_values = result2.get("values", [])
-    if not a_values:
-        return {
-            "message": "Task deleted (row removed). No remaining tasks to renumber.",
-            "deleted_row": target_row_index_1based
-        }
-
-    def _safe_int_from_wbs(w: str):
-        try:
-            return int((w or "").lower().replace("wbs", "").strip())
-        except Exception:
-            return None
-
-    first = (a_values[0][0] or "").strip()
-    start_num = _safe_int_from_wbs(first)
-    if start_num is None:
-        start_num = 0
-
-    new_wbs_col = [[f"wbs{start_num + i}"] for i in range(len(a_values))]
-    try:
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_title}!A2:A{len(new_wbs_col)+1}",
-            valueInputOption="RAW",
-            body={"values": new_wbs_col}
-        ).execute()
+        a_vals = resA.get("values", [])
+        def _start(a0):
+            try: return int((a0 or "").lower().replace("wbs","").strip())
+            except: return 0
+        start_num = _start((a_vals[0][0] if a_vals and a_vals[0] else "").strip()) if a_vals else 0
+        new_wbs = [[f"wbs{start_num + i}"] for i in range(len(a_vals))]
+        if new_wbs:
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_title}!A2:A{len(new_wbs)+1}",
+                valueInputOption="RAW",
+                body={"values": new_wbs}
+            ).execute()
     except Exception as e:
         return JSONResponse({"error": f"Renumber failed: {e}"}, status_code=500)
 
-    return {
-        "message": "Task deleted (row removed) and WBS renumbered",
-        "deleted_row": target_row_index_1based,
-        "renumber": {"start": start_num, "count": len(new_wbs_col)}
-    }
+    # raw_units も同期しておく（将来の再配分の一貫性）
+    try:
+        raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id) or []
+        kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+        raw_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, kept)
+    except Exception as e:
+        print("[warn] raw sync failed:", e)
+        raw_uri = None
 
+    return {"deleted": len(targets), "renumbered": True, "requested": list(wset), "raw_backup_uri": raw_uri}
+
+# === New: Delete selected WBS then compact forward ===
+@app.post("/delete_and_compact", dependencies=[Depends(verify_api_key)])
+def delete_and_compact(payload: dict = Body(...)):
+    """
+    body:
+      {
+        "user_id": "...",
+        "wbs_id": "wbs12",               # 単数OK
+        "wbs_ids": ["wbs12","wbs13"],    # 複数OK
+        "weekday_minutes": 60,
+        "weekend_minutes": 180,
+        "rest_days": ["Wed"],
+        "dry_run": false
+      }
+    手順:
+      1) raw_units を読み込み → 指定WBSを除去
+      2) 影響開始日（= 除去ユニットの最小日付）から _redistribute_units_forward で前詰め
+      3) まとめ直してシート上書き（WBS振り直し）＋ raw_units 保存
+    """
+    user_id = (payload.get("user_id") or "").strip()
+    dry_run = bool(payload.get("dry_run", False))
+    w1 = (payload.get("wbs_id") or "").strip()
+    wN = payload.get("wbs_ids") or []
+    wbs_ids = [w1] if (w1 and not wN) else (wN if wN else ([w1] if w1 else []))
+    if not user_id or not wbs_ids:
+        return JSONResponse({"error": "user_id and at least one of wbs_id/wbs_ids are required"}, status_code=400)
+
+    weekday_minutes = int(payload.get("weekday_minutes", 60))
+    weekend_minutes = int(payload.get("weekend_minutes", 180))
+    rest_days = payload.get("rest_days") or []
+
+    spreadsheet_id = get_user_spreadsheet_id(user_id)
+    if not spreadsheet_id:
+        return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
+
+    # raw_units を操作（シートは最後に上書き）
+    raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id)
+    if not raw_units:
+        return JSONResponse({"error": "raw units not found. Please /generate or /regenerate first."}, status_code=409)
+
+    wset = set(str(w).strip() for w in wbs_ids)
+    def _p(s):
+        try: return datetime.strptime(s, "%Y-%m-%d").date()
+        except: return None
+
+    removed = [u for u in raw_units if (str(u.get("WBS","")).strip() in wset)]
+    if not removed:
+        return {"deleted": 0, "compacted": False, "wbs": list(wset)}
+
+    from_date = min(_p(u.get("Date","")) for u in removed if _p(u.get("Date","")))
+    kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "wbs": list(wset),
+            "delete_count": len(removed),
+            "compact_from": from_date.isoformat() if from_date else None
+        }
+
+    new_units = _redistribute_units_forward(
+        kept, from_date, weekday_minutes=weekday_minutes, weekend_minutes=weekend_minutes, rest_days=rest_days
+    )
+    plan_df = _summarize_units_to_plan_df(new_units)
+
+    # シート上書き（WBSは関数内で振り直される）
+    try:
+        write_tasks_to_sheet(spreadsheet_id, plan_df, user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+
+    # raw 上書き保存
+    try:
+        raw_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, new_units)
+    except Exception as e:
+        print("[warn] save raw failed:", e); raw_uri = None
+
+    return {
+        "ok": True,
+        "wbs": list(wset),
+        "deleted": len(removed),
+        "compact_from": from_date.isoformat() if from_date else None,
+        "spreadsheet_id": spreadsheet_id,
+        "raw_backup_uri": raw_uri,
+        "preview_head": plan_df.head(10).to_dict(orient="records")
+    }
+    
 # === New: Preview tasks for a week ===
 @app.post("/preview_week", dependencies=[Depends(verify_api_key)])
 def preview_week(payload: dict = Body(...)):
@@ -1946,29 +2034,43 @@ def _redistribute_units_after_day_off(
 ) -> List[Dict[str, object]]:
     """
     raw_units（step8統合前の最小単位）を、off_date 以降について再配分する。
+
     - off_date より前は手を付けない
     - off_date 当日は容量0
     - repeat_weekday=True の場合、off_date の曜日を以降ずっと休みにする
     - 1ユニットの分割はしない（生成時の最小単位を保つ）
     """
+
     def u_date(u):
         return _parse_date(str(u.get("Date", "")).strip())
 
     # 安定ソートキー（元の順序を最大限維持）
     def key(u):
-        return (u_date(u) or datetime(1970,1,1).date(), _wbs_num(str(u.get("WBS","wbs999999"))))
+        return (
+            u_date(u) or datetime(1970, 1, 1).date(),
+            _wbs_num(str(u.get("WBS", "wbs999999")))
+        )
 
     # 前半（off_date より前）はそのまま、後半（off_date 以降）を再配分
     before = [u for u in raw_units if (u_date(u) and u_date(u) < off_date)]
-    tail   = [u for u in raw_units if (u_date(u) and u_date(u) >= off_date)]
+    tail = [u for u in raw_units if (u_date(u) and u_date(u) >= off_date)]
     tail.sort(key=key)
 
     # 再配分開始
     cur = off_date
     i = 0
     reassigned = []
+
     while i < len(tail):
-        cap = _capacity_for_date(cur, weekday_minutes, weekend_minutes, rest_days, off_date, repeat_weekday)
+        cap = _capacity_for_date(
+            cur,
+            weekday_minutes,
+            weekend_minutes,
+            rest_days,
+            off_date,
+            repeat_weekday
+        )
+
         if cap <= 0:
             cur = cur + timedelta(days=1)
             continue
@@ -1980,8 +2082,8 @@ def _redistribute_units_after_day_off(
                 dur = int(tail[i].get("Duration", 0))
             except Exception:
                 dur = 0
-            if dur <= 0:
-                # 異常値はスキップ
+
+            if dur <= 0:  # 異常値はスキップ
                 u = tail[i].copy()
                 u["Date"] = cur.isoformat()
                 reassigned.append(u)
@@ -1996,9 +2098,49 @@ def _redistribute_units_after_day_off(
                 i += 1
             else:
                 break  # 次の日へ
+
         cur = cur + timedelta(days=1)
 
     return before + reassigned
+
+def _redistribute_units_forward(
+    raw_units: List[Dict[str, object]],
+    from_date: datetime.date,
+    weekday_minutes: int,
+    weekend_minutes: int,
+    rest_days: List[str],
+) -> List[Dict[str, object]]:
+    def _p(s):
+        try: return datetime.strptime(s, "%Y-%m-%d").date()
+        except: return None
+    def _key(u):
+        d = _p(str(u.get("Date","")).strip()) or datetime(1970,1,1).date()
+        try: n = int(str(u.get("WBS","wbs999999")).replace("wbs","").strip())
+        except: n = 10**9
+        return (d, n)
+
+    before = [u for u in raw_units if _p(u.get("Date","")) and _p(u["Date"]) < from_date]
+    tail   = [u for u in raw_units if _p(u.get("Date","")) and _p(u["Date"]) >= from_date]
+    tail.sort(key=_key)
+
+    cur = from_date
+    i = 0
+    out = []
+    while i < len(tail):
+        cap = _capacity_for_date(cur, weekday_minutes, weekend_minutes, rest_days, off_date=from_date, repeat_weekday=False)
+        if cap <= 0:
+            cur = cur + timedelta(days=1); continue
+        used = 0
+        while i < len(tail):
+            try: dur = int(tail[i].get("Duration", 0))
+            except: dur = 0
+            u = tail[i].copy(); u["Date"] = cur.isoformat()
+            if dur <= 0 or used + dur <= cap:
+                out.append(u); used += max(dur, 0); i += 1
+            else:
+                break
+        cur = cur + timedelta(days=1)
+    return before + out
 
 def _summarize_units_to_plan_df(units: List[Dict[str, object]]) -> pd.DataFrame:
     """
