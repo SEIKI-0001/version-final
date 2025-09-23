@@ -1107,9 +1107,22 @@ def get_tasks(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
+    # get_tasks 内、svc is None の分岐を置き換え
     svc = get_user_sheets_service(user_id)
     if svc is None:
-        return JSONResponse({"error": "Authorization required"}, status_code=401)
+        if not required_envs_ok():
+            return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
+        flow = build_flow()
+        state = signed_state(user_id)
+        save_oauth_state(state, {"user_id": user_id})
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent", state=state
+        )
+        return JSONResponse({
+            "requires_auth": True,
+            "authorize_url": auth_url,
+            "message": "Authorization required. Please authorize via the URL, then retry."
+        }, status_code=200)
 
     try:
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
