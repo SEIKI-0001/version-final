@@ -126,13 +126,15 @@ def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
         if not creds.valid:
             creds.refresh(GoogleRequest())
     except RefreshError as e:
-        # 本当に失効/クライアント不整合の時だけ削除
         msg = (e.args[0] if e.args else "")
         if "invalid_grant" in str(msg) or "invalid_client" in str(msg):
             _delete_refresh_token(user_id)
         _ACCESS.pop(user_id, None)
         return None
-   
+
+    _ACCESS[user_id] = creds
+    return creds
+    
 # ===== 追加: Pydantic models =====
 try:
     from pydantic import ConfigDict  # v2
