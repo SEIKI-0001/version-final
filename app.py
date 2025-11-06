@@ -61,10 +61,10 @@ FIELD_TO_COL = {
 
 # ===== その他の定数 =====
 EXEMPT_PATHS = {"/", "/health", "/oauth/start", "/oauth/callback", "/auth/status"}
-STATE_TTL = 10 * 60  # OAuth state の有効期間（秒）
+STATE_TTL = 10 * 60  # OAuth state TTL (seconds)
 def _state_blob(state: str):
     return _token_bucket().blob(f"oauth_state/{state}.json")
-
+    
 def save_oauth_state(state: str, data: dict):
     data = {**data, "exp": int(time.time()) + STATE_TTL}
     _state_blob(state).upload_from_string(json.dumps(data), content_type="application/json")
@@ -75,15 +75,14 @@ def pop_oauth_state(state: str) -> Optional[dict]:
         data = json.loads(b.download_as_text())
         if data.get("exp", 0) < int(time.time()):
             return None
-        # ワンタイム
-        try: 
+        try:
             b.delete()
-        except Exception: 
+        except Exception:
             pass
         return data
     except Exception:
         return None
-
+        
 DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # ===== FastAPI =====
@@ -285,7 +284,7 @@ def verify_state(state: str) -> Optional[str]:
         return user_id
     except Exception:
         return None
-
+        
 @app.get("/oauth/start")
 def oauth_start(user_id: Optional[str] = None):
     if not required_envs_ok():
@@ -297,7 +296,10 @@ def oauth_start(user_id: Optional[str] = None):
     state = signed_state(user_id)
     save_oauth_state(state, {"user_id": user_id})
     auth_url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent", state=state
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=state,
     )
     return RedirectResponse(auth_url, status_code=302)
 
@@ -308,11 +310,10 @@ def oauth_callback(request: Request):
 
     state = request.query_params.get("state", "")
     st = pop_oauth_state(state)
-    # ★ pop に失敗した場合は verify_state(state) から user_id を復元
     user_id = (st or {}).get("user_id") or verify_state(state) or ""
     if not user_id:
         return HTMLResponse("<h3>Invalid state</h3>", status_code=400)
-
+    
     code = request.query_params.get("code")
     if not code:
         return HTMLResponse("<h3>Missing code</h3>", status_code=400)
@@ -1023,8 +1024,8 @@ def generate_plan(payload: dict = Body(...)):
             return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
         flow = build_flow()
         state = signed_state(user_id)
-        # ★ ここが追加：/oauth/start と同じく state を保存
         save_oauth_state(state, {"user_id": user_id})
+
         auth_url, _ = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
