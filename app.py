@@ -1890,7 +1890,7 @@ def calendar_register_week(payload: dict = Body(...)):
             try:
                 body_with_id = dict(body)
                 body_with_id["id"] = ev_id
-                getattr(cal.events(), "import")(
+                cal.events().import_(
                     calendarId=calendar_id,
                     body=body_with_id
                 ).execute()
@@ -1994,7 +1994,10 @@ def calendar_register_by_wbs(payload: dict = Body(...)):
         except Exception as e_upd:
             try:
                 body_with_id = dict(body); body_with_id["id"] = ev_id
-                getattr(cal.events(), "import")(calendarId=calendar_id, body=body_with_id).execute()
+                cal.events().import_(
+                    calendarId=calendar_id,
+                    body=body_with_id
+                ).execute()
                 created.append({"id": ev_id, "title": body.get("summary", ""), "date": date_str})
             except Exception as e_imp:
                 skipped.append({"id": ev_id, "error": f"import failed: {e_imp}"})
