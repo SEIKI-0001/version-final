@@ -827,6 +827,46 @@ def load_raw_plan_units_from_gcs(user_id: str, spreadsheet_id: str) -> Optional[
     except Exception:
         return None
 
+# === Raw Units: stable RID & WBS<->RID map helpers ===
+def _ensure_rids(units: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """
+    raw_units の各要素に安定ID 'RID' を付与（既存には触れない）。
+    r1, r2, ... のようなシンプル連番。既存RIDは温存。
+    """
+    max_id = 0
+    for u in units:
+        rid = str(u.get("RID") or "").strip()
+        if rid.startswith("r"):
+            try:
+                max_id = max(max_id, int(rid[1:]))
+            except Exception:
+                pass
+    next_id = max_id + 1
+    for u in units:
+        if not str(u.get("RID") or "").strip():
+            u["RID"] = f"r{next_id}"
+            next_id += 1
+    return units
+
+def _wbs_raw_map_path(user_id: str, spreadsheet_id: str) -> str:
+    return f"gpts-plans/{user_id}/maps/{spreadsheet_id}.json"
+
+def save_wbs_raw_map(user_id: str, spreadsheet_id: str, mapping: Dict[str, List[str]]) -> str:
+    """
+    1表示行(WBS)が内包する raw RID の配列を保存するマップ。
+    例: {"wbs0": ["r1","r2"], "wbs1": ["r3"]}
+    """
+    blob = gcs().bucket(BACKUP_BUCKET).blob(_wbs_raw_map_path(user_id, spreadsheet_id))
+    blob.upload_from_string(json.dumps(mapping, ensure_ascii=False), content_type="application/json")
+    return f"gs://{BACKUP_BUCKET}/{_wbs_raw_map_path(user_id, spreadsheet_id)}"
+
+def load_wbs_raw_map(user_id: str, spreadsheet_id: str) -> Optional[Dict[str, List[str]]]:
+    blob = gcs().bucket(BACKUP_BUCKET).blob(_wbs_raw_map_path(user_id, spreadsheet_id))
+    try:
+        return json.loads(blob.download_as_text())
+    except Exception:
+        return None
+
 # === URL-backup helpers ===
 def spreadsheet_web_url(spreadsheet_id: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid=0"
@@ -1020,7 +1060,7 @@ def generate_plan(payload: dict = Body(...)):
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
 
-    # 認可チェック（未連携なら authorize_url を 200 で返す）
+    # ---- OAuth check ----
     if not load_user_credentials(user_id):
         if not required_envs_ok():
             return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
@@ -1040,12 +1080,19 @@ def generate_plan(payload: dict = Body(...)):
             "message": "Please authorize via the URL, then retry."
         }, status_code=200)
 
-    # 生成 → Sheets 書き込み
+    # ---- Plan generation ----
     try:
-        plan_df, user, raw_units = generate_study_plan(payload, user_id)  # ← 3値に
+        plan_df, user, raw_units = generate_study_plan(payload, user_id)  # 3 returns
     except Exception as e:
         return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
 
+    # ---- NEW: ensure RID on raw ----
+    raw_units = _ensure_rids(raw_units)   # ★ raw_units に RID 付与
+
+    # ---- NEW: build plan_df again from raw to ensure full consistency ----
+    plan_df, wmap = _summarize_units_to_plan_df(raw_units)  # ★ plan_df & WBS→RID map
+
+    # ---- Write to Sheets ----
     try:
         spreadsheet_id = create_sheet_and_write(plan_df, generate_sheet_title(user), user_id)
     except PermissionError:
@@ -1063,6 +1110,7 @@ def generate_plan(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
 
+    # ---- Save raw units ----
     try:
         raw_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
     except Exception as e:
@@ -1071,8 +1119,7 @@ def generate_plan(payload: dict = Body(...)):
 
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
-    
-    # マッピング保存（失敗しても続行）
+    # ---- Save spreadsheet_id/url mapping ----
     try:
         mapping = load_user_sheet_map()
         mapping[user_id] = {"spreadsheet_id": spreadsheet_id, "spreadsheet_url": spreadsheet_url}
@@ -1080,12 +1127,17 @@ def generate_plan(payload: dict = Body(...)):
     except Exception as e:
         print("[warn] save mapping failed:", e)
 
+    # ---- NEW: Save WBS→RID map ----
+    try:
+        save_wbs_raw_map(user_id, spreadsheet_id, wmap)
+    except Exception as e:
+        print("[warn] save_wbs_raw_map failed:", e)
+
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
-        "raw_backup_uri": raw_uri, 
+        "raw_backup_uri": raw_uri
     }
-
 
 def get_user_spreadsheet_id(user_id: str) -> Optional[str]:
     return (load_user_sheet_map().get(user_id) or {}).get("spreadsheet_id")
@@ -1411,21 +1463,22 @@ def insert_task(payload: dict = Body(...)):
         "wbs": inserted_wbs
     }
 
-# === New: Delete by WBS (single or multiple) and keep raw_units consistent ===
+# === Delete by WBS (single/multiple) with RAW sync by RID-map ===
 @app.post("/delete", dependencies=[Depends(verify_api_key)])
 def delete_tasks(payload: dict = Body(...)):
     """
     body:
       {
         "user_id": "...",
-        "wbs_id": "wbs12",           # 単数でもOK
-        "wbs_ids": ["wbs12","wbs13"],# 複数指定でもOK（wbs_id / wbs_ids どちらでも）
+        "wbs_id": "wbs12",              # 単数OK
+        "wbs_ids": ["wbs12","wbs13"],   # 複数OK（wbs_id / wbs_ids どちらでも）
         "dry_run": false
       }
     挙動:
       - シートから対象行を一括削除（下から）
       - A列WBSを振り直し
-      - raw_units(バックアップ) からも該当ユニットを除去して保存（将来の再配分の一貫性を維持）
+      - RAWユニットは「削除対象WBSに寄与していたRID」を用いて除去して保存
+        （_summarize_units_with_map を使用）
     """
     user_id = (payload.get("user_id") or "").strip()
     dry_run = bool(payload.get("dry_run", False))
@@ -1435,10 +1488,13 @@ def delete_tasks(payload: dict = Body(...)):
 
     if not user_id or not wbs_ids:
         return JSONResponse({"error": "user_id and at least one of wbs_id/wbs_ids are required"}, status_code=400)
-    wset = set(str(w).strip() for w in wbs_ids if str(w).strip())
+
+    # 正規化
+    wset = {str(w).strip() for w in wbs_ids if str(w).strip()}
     if not wset:
         return JSONResponse({"error": "no valid WBS IDs"}, status_code=400)
 
+    # 参照解決
     spreadsheet_id = get_user_spreadsheet_id(user_id)
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
@@ -1446,7 +1502,7 @@ def delete_tasks(payload: dict = Body(...)):
     if svc is None:
         return JSONResponse({"error": "Authorization required"}, status_code=401)
 
-    # シート情報と全行
+    # 現行シート読み込み
     try:
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet = meta["sheets"][0]
@@ -1460,7 +1516,19 @@ def delete_tasks(payload: dict = Body(...)):
 
     values = res.get("values", [])
     if not values or len(values) < 2:
-        return {"deleted": 0, "candidates": []}
+        # シートが空ならRAW側だけ同期（念のため全削除扱い）
+        try:
+            raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id) or []
+            if raw_units:
+                # WBS一致の行を落とす（RIDマップが作れないケースのフォールバック）
+                kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+                raw_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, kept)
+            else:
+                raw_uri = None
+        except Exception as e:
+            print("[warn] raw sync failed (empty sheet):", e)
+            raw_uri = None
+        return {"deleted": 0, "candidates": [], "raw_backup_uri": raw_uri}
 
     headers = values[0]
     rows = values[1:]
@@ -1470,8 +1538,8 @@ def delete_tasks(payload: dict = Body(...)):
     for i, r in enumerate(rows, start=2):
         w = (r[0] if r else "").strip()
         if w in wset:
-            name = (r[headers.index("Task Name")] if "Task Name" in headers and len(r)>headers.index("Task Name") else "")
-            date = (r[headers.index("Date")] if "Date" in headers and len(r)>headers.index("Date") else "")
+            name = (r[headers.index("Task Name")] if "Task Name" in headers and len(r) > headers.index("Task Name") else "")
+            date = (r[headers.index("Date")] if "Date" in headers and len(r) > headers.index("Date") else "")
             targets.append({"row": i, "WBS": w, "Task Name": name, "Date": date})
 
     if dry_run:
@@ -1480,7 +1548,23 @@ def delete_tasks(payload: dict = Body(...)):
     if not targets:
         return {"deleted": 0, "renumbered": False, "requested": list(wset)}
 
-    # 下から deleteDimension
+    # ===== RAW 側のRIDマッピングを先に作る =====
+    # 現在の raw_units を読み込み → そこから「現在の集約結果」を再構築しWBS→RID[]マップを得る
+    try:
+        raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id) or []
+        # 集約と寄与マップ（WBS -> [RID,...]）
+        plan_df_map, wbs_map = _summarize_units_with_map(raw_units)  # ← 新ヘルパ
+        # 削除対象WBSに寄与したRID集合
+        rid_to_remove = set()
+        for w in wset:
+            for rid in wbs_map.get(w, []):
+                rid_to_remove.add(rid)
+    except Exception as e:
+        print("[warn] build rid-map failed, fallback to WBS filter:", e)
+        raw_units = raw_units if 'raw_units' in locals() else []
+        rid_to_remove = None  # フォールバック
+
+    # ===== Sheets 側で削除 =====
     requests = []
     for t in sorted(targets, key=lambda x: x["row"], reverse=True):
         start0 = t["row"] - 1
@@ -1494,7 +1578,7 @@ def delete_tasks(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error": f"Delete failed: {e}"}, status_code=500)
 
-    # WBS 振り直し
+    # WBS 振り直し（A列）
     try:
         resA = svc.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A2:A10000"
@@ -1515,18 +1599,32 @@ def delete_tasks(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error": f"Renumber failed: {e}"}, status_code=500)
 
-    # raw_units も同期しておく（将来の再配分の一貫性）
+    # ===== RAW 同期：RIDベースで除去（失敗時はWBSフォールバック）=====
+    raw_uri = None
     try:
-        raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id) or []
-        kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+        if rid_to_remove is not None:
+            kept = []
+            for i, u in enumerate(raw_units):
+                rid = _unit_rid(u, i)  # ← 新ヘルパ
+                if rid not in rid_to_remove:
+                    kept.append(u)
+        else:
+            # フォールバック：WBS一致で除去（厳密性は落ちる）
+            kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+
         raw_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, kept)
     except Exception as e:
         print("[warn] raw sync failed:", e)
         raw_uri = None
 
-    return {"deleted": len(targets), "renumbered": True, "requested": list(wset), "raw_backup_uri": raw_uri}
+    return {
+        "deleted": len(targets),
+        "renumbered": True,
+        "requested": list(wset),
+        "raw_backup_uri": raw_uri
+    }
 
-# === New: Delete selected WBS then compact forward ===
+# === Delete selected WBS then compact forward (RID-map safe) ===
 @app.post("/delete_and_compact", dependencies=[Depends(verify_api_key)])
 def delete_and_compact(payload: dict = Body(...)):
     """
@@ -1541,9 +1639,11 @@ def delete_and_compact(payload: dict = Body(...)):
         "dry_run": false
       }
     手順:
-      1) raw_units を読み込み → 指定WBSを除去
-      2) 影響開始日（= 除去ユニットの最小日付）から _redistribute_units_forward で前詰め
-      3) まとめ直してシート上書き（WBS振り直し）＋ raw_units 保存
+      1) RAWを読み込み → 集約＆WBS→RID[]マップを作る
+      2) 指定WBSに寄与したRIDをRAWから除去
+      3) 除去ユニットの最小日付 from_date から _redistribute_units_forward で前詰め
+      4) まとめ直してシート上書き（WBS振り直し）＋ RAW保存
+         ※ マップ生成に失敗時は WBS一致のフォールバックで除去
     """
     user_id = (payload.get("user_id") or "").strip()
     dry_run = bool(payload.get("dry_run", False))
@@ -1561,52 +1661,102 @@ def delete_and_compact(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
-    # raw_units を操作（シートは最後に上書き）
+    # RAW取得（必須）
     raw_units = load_raw_plan_units_from_gcs(user_id, spreadsheet_id)
     if not raw_units:
         return JSONResponse({"error": "raw units not found. Please /generate or /regenerate first."}, status_code=409)
 
-    wset = set(str(w).strip() for w in wbs_ids)
-    def _p(s):
-        try: return datetime.strptime(s, "%Y-%m-%d").date()
-        except: return None
+    # 正規化
+    wset = {str(w).strip() for w in wbs_ids if str(w).strip()}
+    if not wset:
+        return JSONResponse({"error": "no valid WBS IDs"}, status_code=400)
 
-    removed = [u for u in raw_units if (str(u.get("WBS","")).strip() in wset)]
-    if not removed:
+    # 1) 集約＆WBS→RID[]マップ作成
+    rid_to_remove = set()
+    removed_dates = []
+    try:
+        # plan_df_map: 集約後のDF（WBS連番付与済）
+        # wbs_map: { "wbsN": [rid1, rid2, ...] } どのRAWがどのWBSに寄与したか
+        plan_df_map, wbs_map = _summarize_units_with_map(raw_units)
+        for w in wset:
+            for rid in wbs_map.get(w, []):
+                rid_to_remove.add(rid)
+        # 対象RIDの元RAWの日付を拾う（from_date算出用）
+        def _p(s):
+            try: return datetime.strptime(s, "%Y-%m-%d").date()
+            except: return None
+        for i, u in enumerate(raw_units):
+            rid = _unit_rid(u, i)
+            if rid in rid_to_remove:
+                d = _p(str(u.get("Date","")).strip())
+                if d: removed_dates.append(d)
+    except Exception as e:
+        # フォールバック：WBS一致でRAWを除去（厳密性は落ちる）
+        print("[warn] rid-map build failed, fallback to WBS filter:", e)
+        rid_to_remove = None
+        def _p(s):
+            try: return datetime.strptime(s, "%Y-%m-%d").date()
+            except: return None
+        # WBS一致ユニットを抽出
+        for u in raw_units:
+            if str(u.get("WBS","")).strip() in wset:
+                d = _p(str(u.get("Date","")).strip())
+                if d: removed_dates.append(d)
+
+    # 2) RAWから除去
+    if rid_to_remove is not None:
+        kept = []
+        for i, u in enumerate(raw_units):
+            rid = _unit_rid(u, i)
+            if rid not in rid_to_remove:
+                kept.append(u)
+        delete_count = len(raw_units) - len(kept)
+    else:
+        kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+        delete_count = len(raw_units) - len(kept)
+
+    # 対象無ければそのまま返す
+    if delete_count <= 0:
         return {"deleted": 0, "compacted": False, "wbs": list(wset)}
 
-    from_date = min(_p(u.get("Date","")) for u in removed if _p(u.get("Date","")))
-    kept = [u for u in raw_units if (str(u.get("WBS","")).strip() not in wset)]
+    # 3) 前詰め開始日
+    from_date = min(removed_dates) if removed_dates else None
 
     if dry_run:
         return {
             "dry_run": True,
             "wbs": list(wset),
-            "delete_count": len(removed),
+            "delete_count": delete_count,
             "compact_from": from_date.isoformat() if from_date else None
         }
 
+    # 4) 前詰め再配分 → 再集約
     new_units = _redistribute_units_forward(
-        kept, from_date, weekday_minutes=weekday_minutes, weekend_minutes=weekend_minutes, rest_days=rest_days
+        kept,
+        from_date if from_date else (datetime.utcnow().date()),
+        weekday_minutes=weekday_minutes,
+        weekend_minutes=weekend_minutes,
+        rest_days=rest_days
     )
     plan_df = _summarize_units_to_plan_df(new_units)
 
-    # シート上書き（WBSは関数内で振り直される）
+    # シート上書き（WBSは write_tasks_to_sheet 内で振り直された DF をそのまま保存）
     try:
         write_tasks_to_sheet(spreadsheet_id, plan_df, user_id)
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
 
-    # raw 上書き保存
+    # RAW保存
     try:
         raw_uri = save_raw_plan_units_to_gcs(user_id, spreadsheet_id, new_units)
     except Exception as e:
-        print("[warn] save raw failed:", e); raw_uri = None
+        print("[warn] save raw failed:", e)
+        raw_uri = None
 
     return {
         "ok": True,
         "wbs": list(wset),
-        "deleted": len(removed),
+        "deleted": delete_count,
         "compact_from": from_date.isoformat() if from_date else None,
         "spreadsheet_id": spreadsheet_id,
         "raw_backup_uri": raw_uri,
@@ -1935,7 +2085,7 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
-    # 認可
+    # ---- OAuth check ----
     if not load_user_credentials(user_id):
         if not required_envs_ok():
             return JSONResponse({"error": "OAuth not configured on server"}, status_code=500)
@@ -1949,35 +2099,45 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
             "message": "Please authorize via the URL, then retry."
         }, status_code=200)
 
-    # 新プラン生成
+    # ---- New plan generation ----
     try:
         plan_df, user, raw_units = generate_study_plan(payload, user_id)
     except Exception as e:
         return JSONResponse({"error": f"plan generation failed: {e}"}, status_code=400)
 
-    svc = get_user_sheets_service(user_id)
-    if svc is None:
-        return JSONResponse({"error": "Authorization required"}, status_code=401)
+    # === NEW: raw に RID 付与 ===
+    raw_units = _ensure_rids(raw_units)
 
-    # ←← ここから下を関数内にインデント！
-    # 上書き前に「URL履歴」を追記（CSVバックアップは行わない）
+    # === NEW: raw_units から再サマリして plan_df + WBS→RID map を生成 ===
+    plan_df, wmap = _summarize_units_to_plan_df(raw_units)
+
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+
+    # ---- Write sheet backup history ----
     try:
         history_uri = append_url_backup(user.user_id, spreadsheet_id, spreadsheet_url, note="regenerate-before-overwrite")
     except Exception as e:
         print("[warn] append_url_backup failed:", e)
         history_uri = None
 
-    # シート上書き ＋ raw_units を保存
+    # ---- Write updated plan to Sheets ----
     try:
         write_tasks_to_sheet(spreadsheet_id, plan_df, user.user_id)
-        try:
-            raw_backup_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
-        except Exception as e:
-            print("[warn] save raw units failed:", e)
-            raw_backup_uri = None
     except Exception as e:
         return JSONResponse({"error": f"Sheets error: {e}"}, status_code=500)
+
+    # ---- Save raw units ----
+    try:
+        raw_backup_uri = save_raw_plan_units_to_gcs(user.user_id, spreadsheet_id, raw_units)
+    except Exception as e:
+        print("[warn] save raw units failed:", e)
+        raw_backup_uri = None
+
+    # ---- NEW: Save WBS→RID map ----
+    try:
+        save_wbs_raw_map(user_id, spreadsheet_id, wmap)
+    except Exception as e:
+        print("[warn] save_wbs_raw_map failed:", e)
 
     return {
         "ok": True,
@@ -2002,9 +2162,12 @@ def _wbs_num(w: str) -> int:
         return 10**9
 
 def _is_review_task(name: str) -> bool:
-    n = name or ""
-    return ("復習" in n) or ("アプリ演習" in n)
-
+    """サマリーで『結合しない』特殊タスクを判定"""
+    n = (name or "").strip()
+    if not n:
+        return False
+    return ("復習" in n) or ("アプリ演習" in n) or (n == "リフレッシュ日")
+    
 def _capacity_for_date(d: datetime.date, weekday_minutes: int, weekend_minutes: int,
                        rest_days: List[str], off_date: datetime.date,
                        repeat_weekday: bool) -> int:
@@ -2138,49 +2301,57 @@ def _redistribute_units_forward(
         cur = cur + timedelta(days=1)
     return before + out
 
-def _summarize_units_to_plan_df(units: List[Dict[str, object]]) -> pd.DataFrame:
-    """
-    StudyPlanner.step8/9 と同等の日別まとめを最小限で再現。
-    - 通常タスクは同日内で結合（【1周】/【2周】/【3周】 + first – last）
-    - 「復習」「アプリ演習」は個別に残す
-    """
-    from collections import defaultdict
+# 残す: 安定ID生成（新規）
+def _unit_rid(u: Dict[str, object], idx: int) -> str:
+    rid = str(u.get("RID") or "").strip()
+    if rid:
+        return rid
+    w = str(u.get("WBS","")).strip()
+    t = str(u.get("Task","")).strip()
+    d = str(u.get("Date","")).strip()
+    return f"{w}|{d}|{t}|{idx}"
 
-    # Taskオブジェクト相当を簡易に作る
+# 置き換え: _summarize_units_with_map 内で _is_review_task を使用
+def _summarize_units_with_map(units: List[Dict[str, object]]) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+    from collections import defaultdict
     class _T:
-        __slots__ = ("WBS","Task_Name","Date","Duration","Status")
-        def __init__(self, WBS, name, date_str, dur, status):
+        __slots__ = ("rid","WBS","Task_Name","Date","Duration","Status")
+        def __init__(self, rid, WBS, name, date_str, dur, status):
+            self.rid = rid
             self.WBS = WBS
             self.Task_Name = name
             self.Date = datetime.strptime(date_str, "%Y-%m-%d")
             self.Duration = int(dur) if str(dur).isdigit() else 0
             self.Status = status or "未着手"
         @property
-        def Day(self):
-            return DAY_ABBR[self.Date.weekday()]
+        def Day(self): return DAY_ABBR[self.Date.weekday()]
 
     tasks = []
-    for u in units:
+    for i, u in enumerate(units):
         tasks.append(_T(
-            u.get("WBS",""),
-            u.get("Task",""),
+            _unit_rid(u, i),
+            str(u.get("WBS","")),
+            str(u.get("Task","")),
             str(u.get("Date","")).strip(),
-            u.get("Duration",0),
-            u.get("Status","未着手"),
+            u.get("Duration", 0),
+            str(u.get("Status","未着手"))
         ))
 
     grouped = defaultdict(list)
     for t in tasks:
         grouped[t.Date.date()].append(t)
 
-    new_tasks = []
+    new_rows, contrib = [], []
     for date in sorted(grouped.keys()):
         day_tasks = grouped[date]
-        normal = [t for t in day_tasks if not _is_review_task(t.Task_Name)]
+        normal = [t for t in day_tasks if not _is_review_task(t.Task_Name)]  # ←ここだけ
         review = [t for t in day_tasks if t not in normal]
 
         if len(normal) == 1:
-            new_tasks.extend(normal)
+            t = normal[0]
+            new_rows.append({"WBS":"", "Task Name": t.Task_Name, "Date": t.Date.strftime('%Y-%m-%d'),
+                             "Day": t.Day, "Duration": t.Duration, "Status": t.Status})
+            contrib.append([t.rid])
         elif len(normal) > 1:
             first, last = normal[0], normal[-1]
             if "(2nd)" in first.Task_Name: lbl = "【2周】"
@@ -2190,25 +2361,26 @@ def _summarize_units_to_plan_df(units: List[Dict[str, object]]) -> pd.DataFrame:
             def clean(n): return n.replace("(2nd) ", "").replace("(3rd) ", "")
             combined = f"{lbl} {clean(first.Task_Name)} – {clean(last.Task_Name)}".strip()
             total = sum(t.Duration for t in normal)
-            new_tasks.append(_T("", combined, date.isoformat(), total, "未着手"))
-        new_tasks.extend(review)
+            new_rows.append({"WBS":"", "Task Name": combined, "Date": first.Date.strftime('%Y-%m-%d'),
+                             "Day": first.Day, "Duration": total, "Status": "未着手"})
+            contrib.append([t.rid for t in normal])
 
-    # plan_df 生成 & WBS 連番
-    plan_df = pd.DataFrame([{
-        "WBS": "",
-        "Task Name": t.Task_Name,
-        "Date": t.Date.strftime('%Y-%m-%d'),
-        "Day": t.Day,
-        "Duration": t.Duration,
-        "Status": t.Status
-    } for t in sorted(new_tasks, key=lambda x: x.Date)])
-    if plan_df.empty:
-        plan_df = pd.DataFrame(columns=["WBS","Task Name","Date","Day","Duration","Status"])
-    else:
+        for t in review:
+            new_rows.append({"WBS":"", "Task Name": t.Task_Name, "Date": t.Date.strftime('%Y-%m-%d'),
+                             "Day": t.Day, "Duration": t.Duration, "Status": t.Status})
+            contrib.append([t.rid])
+
+    if new_rows:
+        plan_df = pd.DataFrame(new_rows)
         plan_df.reset_index(drop=True, inplace=True)
         plan_df["WBS"] = [f"wbs{i}" for i in range(len(plan_df))]
-    return plan_df
+        wbs_map = {f"wbs{i}": contrib[i] for i in range(len(plan_df))}
+    else:
+        plan_df = pd.DataFrame(columns=["WBS","Task Name","Date","Day","Duration","Status"])
+        wbs_map = {}
 
+    return plan_df[["WBS","Task Name","Date","Day","Duration","Status"]], wbs_map
+    
 # === New: Day-off endpoint ===
 @app.post("/day_off", dependencies=[Depends(verify_api_key)])
 def day_off(payload: dict = Body(...)):
