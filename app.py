@@ -1090,7 +1090,7 @@ def generate_plan(payload: dict = Body(...)):
     raw_units = _ensure_rids(raw_units)   # ★ raw_units に RID 付与
 
     # ---- NEW: build plan_df again from raw to ensure full consistency ----
-    plan_df, wmap = _summarize_units_to_plan_df(raw_units)  # ★ plan_df & WBS→RID map
+    plan_df, wmap = _summarize_units_with_map(raw_units)
 
     # ---- Write to Sheets ----
     try:
@@ -1738,7 +1738,7 @@ def delete_and_compact(payload: dict = Body(...)):
         weekend_minutes=weekend_minutes,
         rest_days=rest_days
     )
-    plan_df = _summarize_units_to_plan_df(new_units)
+    plan_df, _ = _summarize_units_with_map(new_units)
 
     # シート上書き（WBSは write_tasks_to_sheet 内で振り直された DF をそのまま保存）
     try:
@@ -2018,7 +2018,7 @@ def backup_only(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
-    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    spreadsheet_url = spreadsheet_web_url(spreadsheet_id)
     try:
         hist_uri = append_url_backup(user_id, spreadsheet_id, spreadsheet_url, note=note)
         return {
@@ -2063,7 +2063,7 @@ def switch_active_sheet(payload: dict = Body(...)):
     if not user_id or not spreadsheet_id:
         return JSONResponse({"error": "user_id and spreadsheet_id are required"}, status_code=400)
 
-    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    spreadsheet_url = spreadsheet_web_url(spreadsheet_id)
     try:
         mapping = load_user_sheet_map()
         mapping[user_id] = {
@@ -2109,7 +2109,7 @@ def regenerate_and_overwrite(payload: dict = Body(...)):
     raw_units = _ensure_rids(raw_units)
 
     # === NEW: raw_units から再サマリして plan_df + WBS→RID map を生成 ===
-    plan_df, wmap = _summarize_units_to_plan_df(raw_units)
+    plan_df, wmap = _summarize_units_with_map(raw_units)
 
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
@@ -2442,7 +2442,7 @@ def day_off(payload: dict = Body(...)):
     )
 
     # まとめ直して plan_df を作る
-    plan_df = _summarize_units_to_plan_df(new_units)
+    plan_df, _ = _summarize_units_with_map(new_units)
 
     # シート上書き
     try:
