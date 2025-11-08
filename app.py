@@ -1129,9 +1129,6 @@ def get_tasks(payload: dict = Body(...)):
     
 @app.post("/get_tasks_full", dependencies=[Depends(verify_api_key)])
 def get_tasks_full(payload: dict = Body(...)):
-    """
-    旧 /get_tasks の振る舞い：計画の中身（A1:F10000）を返す
-    """
     user_id = (payload.get("user_id") or "").strip()
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
@@ -1156,18 +1153,24 @@ def get_tasks_full(payload: dict = Body(...)):
     if not spreadsheet_id:
         return JSONResponse({"error": "spreadsheet not found"}, status_code=404)
 
+    spreadsheet_url = spreadsheet_web_url(spreadsheet_id)
+
     try:
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet_title = meta["sheets"][0]["properties"]["title"]
         res = svc.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F10000"
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:F1000"
         ).execute()
     except Exception as e:
         return JSONResponse({"error": f"Failed to read sheet: {e}"}, status_code=500)
 
     values = res.get("values", [])
     if not values or len(values) < 2:
-        return {"tasks": []}
+        return {
+            "spreadsheet_id": spreadsheet_id,
+            "spreadsheet_url": spreadsheet_url,
+            "tasks": []
+        }
 
     headers = values[0]
     rows = values[1:]
@@ -1176,8 +1179,11 @@ def get_tasks_full(payload: dict = Body(...)):
         for row in rows
         if any((c or "").strip() for c in row)
     ]
-    return {"tasks": tasks}
-
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "tasks": tasks
+    }
 
 # === New: Update task fields by WBS (single sheet) ===
 @app.post("/update_task", dependencies=[Depends(verify_api_key)])
