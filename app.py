@@ -126,11 +126,19 @@ def _get_creds_cached(user_id: str) -> Optional[UserCredentials]:
         if not creds.valid:
             creds.refresh(GoogleRequest())
     except RefreshError as e:
-        msg = (e.args[0] if e.args else "")
-        if "invalid_grant" in str(msg) or "invalid_client" in str(msg):
+        msg = str(e)  # ← こっちの方が情報リッチで扱いやすい
+
+        # ▼ 本当に再認証が必要なケースだけ refresh_token を削除
+        if "invalid_grant" in msg or "invalid_client" in msg:
             _delete_refresh_token(user_id)
-        _ACCESS.pop(user_id, None)
-        return None
+            _ACCESS.pop(user_id, None)
+            return None  # → この場合だけユーザーに再認証を要求する
+
+        # ▼ それ以外のエラーは「一時的なエラー」として扱う（トークンは残す）
+        raise HTTPException(
+            status_code=503,
+            detail=f"Temporary OAuth refresh error: {msg}"
+        )
 
     _ACCESS[user_id] = creds
     return creds
